@@ -50,3 +50,58 @@ fn normalized(body: &Value) -> Value {
     }
     Value::Object(obj)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn model(provider: &str, name: &str) -> ModelEntry {
+        ModelEntry {
+            provider: provider.into(),
+            model: name.into(),
+            tier: 1,
+            context: 8000,
+            supports_tools: false,
+            input_per_mtok: 0.0,
+            output_per_mtok: 0.0,
+        }
+    }
+
+    #[test]
+    fn stable_across_reordered_keys() {
+        let m = model("openai", "gpt");
+        let a = json!({ "temperature": 0.2, "messages": [{ "role": "user", "content": "hi" }] });
+        let b = json!({ "messages": [{ "role": "user", "content": "hi" }], "temperature": 0.2 });
+        assert_eq!(cache_key(&m, &a), cache_key(&m, &b));
+    }
+
+    #[test]
+    fn volatile_fields_do_not_affect_key() {
+        let m = model("openai", "gpt");
+        let a = json!({ "messages": [{ "role": "user", "content": "hi" }], "stream": true, "user": "alice" });
+        let b = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        assert_eq!(cache_key(&m, &a), cache_key(&m, &b));
+    }
+
+    #[test]
+    fn isolated_per_model() {
+        let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        assert_ne!(cache_key(&model("openai", "gpt"), &body), cache_key(&model("openai", "gpt-mini"), &body));
+        assert_ne!(cache_key(&model("openai", "gpt"), &body), cache_key(&model("azure", "gpt"), &body));
+    }
+
+    #[test]
+    fn different_content_differs() {
+        let m = model("openai", "gpt");
+        let a = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        let b = json!({ "messages": [{ "role": "user", "content": "bye" }] });
+        assert_ne!(cache_key(&m, &a), cache_key(&m, &b));
+    }
+
+    #[test]
+    fn conversation_len_counts_messages() {
+        assert_eq!(conversation_len(&json!({ "messages": [{}, {}, {}] })), 3);
+        assert_eq!(conversation_len(&json!({})), 0);
+    }
+}

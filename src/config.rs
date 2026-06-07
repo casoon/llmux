@@ -198,4 +198,128 @@ impl Config {
     pub fn provider_is_local(&self, provider: &str) -> bool {
         self.providers.get(provider).map(|p| p.local).unwrap_or(false)
     }
+
+    /// Prüft die Konfiguration auf Konsistenz, damit Fehlkonfiguration beim Start
+    /// auffällt statt erst beim ersten Request. Sammelt alle Verstöße.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use crate::classifier::TaskType;
+
+        let mut errors: Vec<String> = Vec::new();
+
+        // 1. Jedes Modell verweist auf einen definierten Provider.
+        for m in &self.models {
+            if !self.providers.contains_key(&m.provider) {
+                errors.push(format!(
+                    "Modell '{}' verweist auf unbekannten Provider '{}'",
+                    m.model, m.provider
+                ));
+            }
+        }
+
+        // 2. classification-Schlüssel und Klassifikator-task_types decken sich exakt.
+        let known: Vec<&str> = TaskType::ALL.iter().map(|t| t.as_key()).collect();
+        for key in self.classification.keys() {
+            if !known.contains(&key.as_str()) {
+                errors.push(format!(
+                    "classification-Schlüssel '{key}' wird vom Klassifikator nie erzeugt"
+                ));
+            }
+        }
+        for key in &known {
+            if !self.classification.contains_key(*key) {
+                errors.push(format!(
+                    "task_type '{key}' wird klassifiziert, hat aber keine classification-Regel"
+                ));
+            }
+        }
+
+        // 3. Jede Routing-Anforderung ist erfüllbar: mindestens ein Modell, das
+        //    Tier-Floor, Tool- und Local-Zwang der Regel gleichzeitig erfüllt.
+        for (key, rule) in &self.classification {
+            let satisfiable = self.models.iter().any(|m| {
+                m.tier >= rule.min_tier
+                    && (!rule.require_tools || m.supports_tools)
+                    && (!rule.local_only || self.provider_is_local(&m.provider))
+            });
+            if !satisfiable {
+                errors.push(format!(
+                    "task_type '{key}' ist nicht erfüllbar: kein Modell mit tier>={}{}{}",
+                    rule.min_tier,
+                    if rule.require_tools { " + Tool-Support" } else { "" },
+                    if rule.local_only { " + lokalem Provider" } else { "" },
+                ));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Konfiguration ungültig:\n  - {}",
+                errors.join("\n  - ")
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> Config {
+        serde_yaml::from_str(yaml).expect("fixture parses")
+    }
+
+    // Vollständige, gültige Minimalkonfiguration (alle 5 task_types erfüllbar).
+    const VALID: &str = r#"
+server: { host: "127.0.0.1", port: 0 }
+providers:
+  local_p: { enabled: true, base_url: "http://localhost/v1", local: true }
+  cloud_p: { enabled: true, base_url: "https://example.com/v1" }
+models:
+  - { provider: local_p, model: "local-small", tier: 1, context: 8000, supports_tools: true, input_per_mtok: 0.0, output_per_mtok: 0.0 }
+  - { provider: cloud_p, model: "big",         tier: 5, context: 8000, supports_tools: true, input_per_mtok: 1.0, output_per_mtok: 1.0 }
+classification:
+  simple_text:       { min_tier: 1 }
+  summarize:         { min_tier: 1 }
+  code_review:       { min_tier: 3 }
+  architecture:      { min_tier: 4 }
+  private_sensitive: { min_tier: 1, local_only: true }
+"#;
+
+    #[test]
+    fn valid_config_passes() {
+        assert!(parse(VALID).validate().is_ok());
+    }
+
+    #[test]
+    fn shipped_example_config_validates() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/llmux.example.yaml");
+        let cfg = Config::load(path).expect("example config loads");
+        cfg.validate().expect("example config must validate");
+    }
+
+    #[test]
+    fn rejects_unknown_provider_reference() {
+        let yaml = VALID.replace("provider: cloud_p, model: \"big\"", "provider: ghost, model: \"big\"");
+        let err = parse(&yaml).validate().unwrap_err().to_string();
+        assert!(err.contains("unbekannten Provider 'ghost'"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_classification_key() {
+        let yaml = VALID.replace("simple_text:       { min_tier: 1 }", "made_up:           { min_tier: 1 }");
+        let err = parse(&yaml).validate().unwrap_err().to_string();
+        assert!(err.contains("made_up"), "got: {err}");
+        // simple_text fehlt nun -> auch das wird gemeldet.
+        assert!(err.contains("simple_text"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_tier_floor() {
+        // architecture verlangt tier>=4, aber kein Modell erreicht das.
+        let yaml = VALID.replace("tier: 5", "tier: 3");
+        let err = parse(&yaml).validate().unwrap_err().to_string();
+        assert!(err.contains("architecture") && err.contains("nicht erfüllbar"), "got: {err}");
+    }
 }

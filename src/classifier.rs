@@ -14,6 +14,15 @@ pub enum TaskType {
 }
 
 impl TaskType {
+    /// Alle vom Klassifikator erzeugbaren task_types (für Config-Validierung).
+    pub const ALL: [TaskType; 5] = [
+        TaskType::PrivateSensitive,
+        TaskType::Architecture,
+        TaskType::CodeReview,
+        TaskType::Summarize,
+        TaskType::SimpleText,
+    ];
+
     /// Schlüssel in der classification-Tabelle der Config.
     pub fn as_key(&self) -> &'static str {
         match self {
@@ -101,4 +110,55 @@ pub fn requires_tools(body: &Value) -> bool {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn classify_plain(text: &str) -> TaskType {
+        classify(text, &[])
+    }
+
+    #[test]
+    fn classifies_each_task_type() {
+        assert_eq!(classify_plain("Erkläre mir die Architektur dieses Systems"), TaskType::Architecture);
+        assert_eq!(classify_plain("Bitte refactor diese function"), TaskType::CodeReview);
+        assert_eq!(classify_plain("Fasse zusammen, worum es geht"), TaskType::Summarize);
+        assert_eq!(classify_plain("Wie ist das Wetter heute?"), TaskType::SimpleText);
+    }
+
+    #[test]
+    fn privacy_overrides_everything() {
+        let patterns = vec!["PRIVATE_KEY".to_string()];
+        // Inhalt wäre sonst CodeReview ("function"), Privacy gewinnt.
+        let t = classify("function with PRIVATE_KEY embedded", &patterns);
+        assert_eq!(t, TaskType::PrivateSensitive);
+    }
+
+    #[test]
+    fn detects_tool_definitions() {
+        let body = json!({ "tools": [{ "type": "function", "function": { "name": "x" } }] });
+        assert!(requires_tools(&body));
+    }
+
+    #[test]
+    fn detects_forced_tool_choice() {
+        assert!(requires_tools(&json!({ "tool_choice": "auto" })));
+        assert!(requires_tools(&json!({ "tool_choice": { "type": "function" } })));
+        assert!(!requires_tools(&json!({ "tool_choice": "none" })));
+    }
+
+    #[test]
+    fn detects_tool_role_in_history() {
+        let body = json!({ "messages": [{ "role": "tool", "content": "result" }] });
+        assert!(requires_tools(&body));
+    }
+
+    #[test]
+    fn plain_chat_requires_no_tools() {
+        let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        assert!(!requires_tools(&body));
+    }
 }

@@ -558,3 +558,29 @@ fn truncate(s: &str, max: usize) -> String {
         .unwrap_or(0);
     format!("{}…", &s[..end])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        let cfg = RetryConfig { max_retries: 5, backoff_initial_ms: 500, backoff_max_ms: 8000 };
+        // attempt 0: base 500ms, ±20 % Jitter.
+        let b0 = backoff_ms(&cfg, 0);
+        assert!((400..=600).contains(&b0), "attempt 0 außerhalb Jitter-Band: {b0}");
+        // Hohe attempt: base auf backoff_max_ms gedeckelt, Jitter darum.
+        let capped = backoff_ms(&cfg, 20);
+        assert!(capped >= (8000.0 * 0.8) as u64, "untere Jitter-Grenze verletzt: {capped}");
+        assert!(capped <= (8000.0 * 1.2) as u64, "Deckel verletzt: {capped}");
+    }
+
+    #[test]
+    fn status_classification() {
+        assert!(matches!(classify_status(StatusCode::INTERNAL_SERVER_ERROR), Outcome::Transient));
+        assert!(matches!(classify_status(StatusCode::TOO_MANY_REQUESTS), Outcome::Transient));
+        assert!(matches!(classify_status(StatusCode::UNAUTHORIZED), Outcome::ProviderExhausted));
+        assert!(matches!(classify_status(StatusCode::PAYMENT_REQUIRED), Outcome::ProviderExhausted));
+        assert!(matches!(classify_status(StatusCode::BAD_REQUEST), Outcome::BadRequest));
+    }
+}

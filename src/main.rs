@@ -30,7 +30,8 @@ async fn main() -> anyhow::Result<()> {
     let config_path =
         std::env::var("LLMUX_CONFIG").unwrap_or_else(|_| "config/llmux.yaml".into());
     let cfg = Config::load(&config_path)?;
-    tracing::info!(path = %config_path, "Konfiguration geladen");
+    cfg.validate()?;
+    tracing::info!(path = %config_path, "Konfiguration geladen und validiert");
 
     let db_path = std::env::var("LLMUX_DB").unwrap_or_else(|_| "data/llmux.sqlite".into());
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
