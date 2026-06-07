@@ -217,3 +217,133 @@ fn remaining_budget(cfg: &Config, store: &Store) -> f64 {
     }
     rem
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logging::RequestLog;
+
+    // Provider ohne api_key_env sind immer ready; local_p ist lokal.
+    const BASE: &str = r#"
+server: { host: "127.0.0.1", port: 0 }
+providers:
+  local_p: { enabled: true, base_url: "http://localhost/v1", local: true }
+  cloud_p: { enabled: true, base_url: "https://example.com/v1" }
+models:
+  - { provider: local_p, model: "local-small", tier: 1, context: 8000, supports_tools: false, input_per_mtok: 0.0, output_per_mtok: 0.0 }
+  - { provider: cloud_p, model: "cheap",       tier: 1, context: 8000, supports_tools: true,  input_per_mtok: 0.1, output_per_mtok: 0.1 }
+  - { provider: cloud_p, model: "mid",         tier: 3, context: 8000, supports_tools: true,  input_per_mtok: 1.0, output_per_mtok: 1.0 }
+  - { provider: cloud_p, model: "big",         tier: 5, context: 200000, supports_tools: true, input_per_mtok: 10.0, output_per_mtok: 10.0 }
+classification:
+  simple_text:       { min_tier: 1, expected_output_ratio: 1.0 }
+  summarize:         { min_tier: 1, expected_output_ratio: 1.0 }
+  code_review:       { min_tier: 3, expected_output_ratio: 1.0 }
+  architecture:      { min_tier: 4, expected_output_ratio: 1.0 }
+  private_sensitive: { min_tier: 1, local_only: true, expected_output_ratio: 1.0 }
+"#;
+
+    fn cfg(extra: &str) -> Config {
+        serde_yaml::from_str(&format!("{extra}{BASE}")).expect("fixture parses")
+    }
+
+    fn store() -> Store {
+        Store::open(":memory:").expect("in-memory db")
+    }
+
+    fn input<'a>(task_key: &'a str, requires_tools: bool, input_tokens: u64) -> SelectInput<'a> {
+        SelectInput { task_key, requires_tools, input_tokens, session: None }
+    }
+
+    fn spend(store: &Store, usd: f64) {
+        store
+            .insert(&RequestLog { real_cost_usd: usd, ..Default::default() })
+            .unwrap();
+    }
+
+    #[test]
+    fn cheapest_viable_wins() {
+        let c = cfg("");
+        let s = store();
+        let sel = select(&c, &s, &SessionStore::default(), &input("simple_text", false, 100)).unwrap();
+        assert_eq!(sel.chain[0].model, "local-small");
+        assert!(!sel.degraded);
+    }
+
+    #[test]
+    fn tier_floor_excludes_low_tiers() {
+        let c = cfg("");
+        let s = store();
+        let sel = select(&c, &s, &SessionStore::default(), &input("code_review", false, 100)).unwrap();
+        // tier-1/2 ausgeschlossen, günstigstes der Tier>=3-Kandidaten = mid.
+        assert_eq!(sel.chain[0].model, "mid");
+        assert!(sel.chain.iter().all(|m| m.tier >= 3));
+    }
+
+    #[test]
+    fn tool_filter_excludes_non_tool_models() {
+        let c = cfg("");
+        let s = store();
+        let sel = select(&c, &s, &SessionStore::default(), &input("simple_text", true, 100)).unwrap();
+        // local-small kann keine Tools -> günstigstes tool-fähiges Tier-1 = cheap.
+        assert_eq!(sel.chain[0].model, "cheap");
+        assert!(sel.chain.iter().all(|m| m.supports_tools));
+    }
+
+    #[test]
+    fn local_only_restricts_to_local_provider() {
+        let c = cfg("");
+        let s = store();
+        let sel = select(&c, &s, &SessionStore::default(), &input("private_sensitive", false, 100)).unwrap();
+        assert!(sel.chain.iter().all(|m| c.provider_is_local(&m.provider)));
+        assert_eq!(sel.chain[0].model, "local-small");
+    }
+
+    #[test]
+    fn context_window_must_fit() {
+        let c = cfg("");
+        let s = store();
+        // 100k Input + 100k erwarteter Output = 200k -> nur big passt.
+        let sel = select(&c, &s, &SessionStore::default(), &input("simple_text", false, 100_000)).unwrap();
+        assert_eq!(sel.chain[0].model, "big");
+    }
+
+    #[test]
+    fn budget_pressure_downgrades_with_degraded_flag() {
+        let c = cfg("budgets:\n  daily_max_usd: 1.0\n  pressure_downgrade:\n    - { at: 0.5, max_tier: 2 }\n");
+        let s = store();
+        spend(&s, 0.6); // 60 % Auslastung -> tier_cap = 2
+        let sel = select(&c, &s, &SessionStore::default(), &input("code_review", false, 100)).unwrap();
+        assert!(sel.degraded, "code_review (min_tier 3) muss unter Druck degradieren");
+        assert!(sel.chain.iter().all(|m| m.tier <= 2));
+        assert!(sel.budget_pressure >= 0.5);
+    }
+
+    #[test]
+    fn budget_exceeded_when_cheapest_too_expensive() {
+        let c = cfg("budgets:\n  daily_max_usd: 0.000001\n");
+        let s = store();
+        // code_review schließt das kostenlose lokale Modell aus; mid/big sprengen Restbudget.
+        let err = select(&c, &s, &SessionStore::default(), &input("code_review", false, 1000)).unwrap_err();
+        assert!(matches!(err, SelectError::BudgetExceeded));
+    }
+
+    #[test]
+    fn unknown_task_errors() {
+        let c = cfg("");
+        let s = store();
+        let err = select(&c, &s, &SessionStore::default(), &input("nope", false, 100)).unwrap_err();
+        assert!(matches!(err, SelectError::UnknownTask(_)));
+    }
+
+    #[test]
+    fn session_stickiness_prefers_prior_choice() {
+        let c = cfg("");
+        let s = store();
+        let sessions = SessionStore::default();
+        sessions.set("s1", "cloud_p", "mid", 3);
+        let inp = SelectInput { task_key: "simple_text", requires_tools: false, input_tokens: 100, session: Some("s1") };
+        let sel = select(&c, &s, &sessions, &inp).unwrap();
+        // Trotz günstigerem local-small bleibt der Loop bei mid.
+        assert_eq!(sel.chain[0].model, "mid");
+    }
+}

@@ -146,6 +146,27 @@ impl Store {
         );
     }
 
+    /// Löscht abgelaufene Cache-Einträge. Gibt die Anzahl entfernter Zeilen zurück.
+    pub fn evict_expired_cache(&self) -> usize {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM cache WHERE expires_ts <= ?1", [now])
+            .unwrap_or(0)
+    }
+
+    /// Hält die Cache-Tabelle unter `max` Zeilen, indem die ältesten (nach
+    /// created_ts) entfernt werden. Gibt die Anzahl entfernter Zeilen zurück.
+    pub fn enforce_cache_cap(&self, max: usize) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"DELETE FROM cache WHERE key IN (
+                   SELECT key FROM cache ORDER BY created_ts DESC LIMIT -1 OFFSET ?1
+               )"#,
+            [max as i64],
+        )
+        .unwrap_or(0)
+    }
+
     /// Reale Kostensumme seit Tagesbeginn (UTC).
     pub fn spent_today(&self) -> f64 {
         let since = chrono::Utc::now()
@@ -177,3 +198,76 @@ impl Store {
 }
 
 use chrono::Datelike;
+
+#[cfg(test)]
+impl Store {
+    /// Letzte Log-Zeile als (status, prompt_tokens, completion_tokens, real_cost_usd, cache_hit).
+    pub fn last_request(&self) -> Option<(i64, i64, i64, f64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT status, prompt_tokens, completion_tokens, real_cost_usd, cache_hit \
+             FROM requests ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .unwrap_or(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store::open(":memory:").unwrap()
+    }
+
+    /// Schreibt einen Cache-Eintrag mit explizitem Ablaufzeitpunkt (für Tests).
+    fn insert_cache(store: &Store, key: &str, expires_ts: &str) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO cache (key, model, response, created_ts, expires_ts, hits)
+               VALUES (?1, 'm', '{}', ?2, ?3, 0)"#,
+            rusqlite::params![key, expires_ts, expires_ts],
+        )
+        .unwrap();
+    }
+
+    fn cache_count(store: &Store) -> i64 {
+        let conn = store.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM cache", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn evict_expired_removes_only_stale_rows() {
+        let s = store();
+        let past = "2000-01-01T00:00:00+00:00";
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        insert_cache(&s, "stale", past);
+        insert_cache(&s, "fresh", &future);
+
+        let removed = s.evict_expired_cache();
+        assert_eq!(removed, 1);
+        assert_eq!(cache_count(&s), 1);
+        // Der frische Eintrag ist noch auffindbar.
+        assert!(s.cache_lookup("fresh").is_some());
+    }
+
+    #[test]
+    fn enforce_cap_bounds_table_to_newest() {
+        let s = store();
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        // Drei Einträge mit aufsteigendem created_ts.
+        for (i, key) in ["a", "b", "c"].iter().enumerate() {
+            let ts = (future + chrono::Duration::seconds(i as i64)).to_rfc3339();
+            insert_cache(&s, key, &ts);
+        }
+        let removed = s.enforce_cache_cap(2);
+        assert_eq!(removed, 1);
+        assert_eq!(cache_count(&s), 2);
+        // Der älteste ("a") wurde entfernt, die neuesten bleiben.
+        assert!(s.cache_lookup("a").is_none());
+        assert!(s.cache_lookup("c").is_some());
+    }
+}
