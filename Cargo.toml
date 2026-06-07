@@ -1,0 +1,21 @@
+[package]
+name = "llmux"
+version = "0.1.0"
+edition = "2021"
+description = "Lokaler intent-basierter LLM-Router: bewertet Prompts und wählt Modell, Provider und Kostenstufe."
+license = "Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+rusqlite = { version = "0.32", features = ["bundled"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"

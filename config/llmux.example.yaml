@@ -1,0 +1,79 @@
+# llmux Beispiel-Konfiguration (dynamischer, tier-basierter Router)
+server:
+  host: "0.0.0.0"
+  port: 3456
+
+auth:
+  llmux_key: "mp_dev_changeme"   # leer = keine Auth (nur lokal!)
+
+budgets:
+  daily_max_usd: 2.00
+  monthly_max_usd: 30.00
+  # Mit steigender Budgetauslastung wird die erlaubte Tier-Obergrenze gesenkt
+  # (graceful downgrade). Die restriktivste zutreffende Regel gewinnt.
+  pressure_downgrade:
+    - { at: 0.50, max_tier: 4 }   # ab 50 % Auslastung kein Top-Tier mehr
+    - { at: 0.80, max_tier: 2 }   # ab 80 % nur noch günstige Modelle
+    - { at: 0.95, max_tier: 1 }   # ab 95 % nur noch lokal/free
+
+# Smart Retry: transiente Fehler (5xx/429/Netzwerk) -> gleiches Modell mit Backoff;
+# 401/402/403 -> nächstes Modell; sonstige 4xx -> Abbruch ohne Fallback.
+retry:
+  max_retries: 2
+  backoff_initial_ms: 500
+  backoff_max_ms: 8000
+
+# Exact-Match-Antwort-Cache (kein Embedding). Identische Requests an dasselbe Modell
+# kommen aus SQLite (Kosten 0). Opt-out pro Request via Header x-llmux-no-cache.
+cache:
+  enabled: true
+  ttl_seconds: 1800
+  max_conversation_messages: 3
+
+privacy:
+  local_first: true
+  # Wird ein Pattern erkannt -> task_type private_sensitive (-> nur lokale Provider).
+  block_cloud_patterns:
+    - ".env"
+    - "PRIVATE_KEY"
+    - "API_KEY"
+    - "BEGIN RSA"
+    - "password"
+    - "secret"
+
+providers:
+  openrouter:
+    enabled: true
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+  openai:
+    enabled: true
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+  ollama:
+    enabled: true
+    base_url: "http://localhost:11434/v1"
+    api_key_env: null
+    local: true
+
+# Modell-Katalog: der Selektor wählt daraus dynamisch das günstigste Modell,
+# das Tier-Floor, Tool-Bedarf, Kontextgröße, Privacy und Budget erfüllt.
+# tier: 1 = billig/lokal … 5 = Top-Reasoning. Preise in USD pro 1 Mio Tokens.
+models:
+  - { provider: ollama, model: "qwen2.5", tier: 1, context: 32000, supports_tools: false, input_per_mtok: 0.0, output_per_mtok: 0.0 }
+  - { provider: ollama, model: "deepseek-coder", tier: 2, context: 16000, supports_tools: false, input_per_mtok: 0.0, output_per_mtok: 0.0 }
+  - { provider: openrouter, model: "meta-llama/llama-3.1-8b-instruct:free", tier: 1, context: 128000, supports_tools: true, input_per_mtok: 0.0, output_per_mtok: 0.0 }
+  - { provider: openrouter, model: "google/gemini-flash-1.5", tier: 2, context: 1000000, supports_tools: true, input_per_mtok: 0.075, output_per_mtok: 0.30 }
+  - { provider: openai, model: "gpt-4.1-mini", tier: 3, context: 128000, supports_tools: true, input_per_mtok: 0.40, output_per_mtok: 1.60 }
+  - { provider: openrouter, model: "anthropic/claude-3.5-sonnet", tier: 4, context: 200000, supports_tools: true, input_per_mtok: 3.00, output_per_mtok: 15.00 }
+  - { provider: openrouter, model: "google/gemini-pro-1.5", tier: 4, context: 2000000, supports_tools: true, input_per_mtok: 1.25, output_per_mtok: 5.00 }
+  - { provider: openrouter, model: "anthropic/claude-3-opus", tier: 5, context: 200000, supports_tools: true, input_per_mtok: 15.00, output_per_mtok: 75.00 }
+
+# task_type -> Anforderung. min_tier = Qualitäts-Floor; require_tools/local_only =
+# harte Bedingungen; expected_output_ratio steuert Kostenschätzung & Ranking.
+classification:
+  simple_text:       { min_tier: 1, expected_output_ratio: 0.5 }
+  summarize:         { min_tier: 1, expected_output_ratio: 0.3 }
+  code_review:       { min_tier: 3, expected_output_ratio: 1.0 }
+  architecture:      { min_tier: 4, expected_output_ratio: 1.5 }
+  private_sensitive: { min_tier: 1, local_only: true, expected_output_ratio: 1.0 }

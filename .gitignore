@@ -1,0 +1,6 @@
+/target
+/data/*.sqlite
+/data/*.sqlite-*
+.env
+.claude/
+config/llmux.yaml
