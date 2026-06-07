@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::config::{Config, ModelEntry, RetryConfig};
@@ -52,7 +53,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
     if !check_auth(&state.cfg, &headers) {
         return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
@@ -62,6 +63,13 @@ async fn chat_completions(
     let tool = header(&headers, "x-llmux-tool").unwrap_or_else(|| "unknown".into());
     let session = header(&headers, "x-llmux-session");
     let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+
+    // Beim Streaming reale Usage anfordern (finaler Chunk trägt prompt/completion_tokens).
+    if is_stream {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("stream_options".into(), json!({ "include_usage": true }));
+        }
+    }
 
     // Per-Request-Overrides
     let force_model = header(&headers, "x-llmux-model");
@@ -101,16 +109,27 @@ async fn chat_completions(
         }
     }
 
-    // Cache-Lookup (Exact-Match, opt-out per Header, kein Stream, History-Guard)
+    // Cache-Lookup (Exact-Match, opt-out per Header, History-Guard). Streaming-
+    // Antworten werden separat gecacht (eigener Key-Suffix, SSE-Replay).
     let cacheable = state.cfg.cache.enabled
         && !no_cache
-        && !is_stream
         && cache::conversation_len(&body) <= state.cfg.cache.max_conversation_messages;
-    let cache_key = cacheable.then(|| cache::cache_key(&primary, &body));
+    let cache_key = cacheable.then(|| {
+        let k = cache::cache_key(&primary, &body);
+        if is_stream {
+            format!("{k}#stream")
+        } else {
+            k
+        }
+    });
 
     if let Some(key) = &cache_key {
         if let Some(cached) = state.store.cache_lookup(key) {
-            return cache_hit_response(&state, &primary, &plan, task_key, &tool, &session, cached, started);
+            return if is_stream {
+                cache_hit_stream_response(&state, &primary, &plan, task_key, &tool, &session, cached, started)
+            } else {
+                cache_hit_response(&state, &primary, &plan, task_key, &tool, &session, cached, started)
+            };
         }
     }
 
@@ -188,7 +207,7 @@ fn build_plan(
 
 #[allow(clippy::too_many_arguments)]
 async fn forward_with_retries(
-    state: &AppState,
+    state: &Arc<AppState>,
     body: Value,
     plan: Plan,
     task_key: &str,
@@ -236,7 +255,23 @@ async fn forward_with_retries(
                         }
                         Outcome::BadRequest => {
                             // Request ist fehlerhaft -> kein Fallback, Status durchreichen.
-                            log_failure(&state.store, tool, session, task_key, input_tokens, "bad_request", status.as_u16(), &last_err);
+                            // Echte Versuchszahl + Trail protokollieren (nicht attempts=0).
+                            let _ = state.store.insert(&RequestLog {
+                                tool: tool.into(),
+                                session: session.clone(),
+                                task_type: task_key.into(),
+                                model: entry.model.clone(),
+                                provider: entry.provider.clone(),
+                                tier: plan.tier,
+                                degraded: plan.degraded,
+                                budget_pressure: plan.pressure,
+                                estimated_tokens: input_tokens,
+                                status: status.as_u16(),
+                                attempts,
+                                attempt_trail: serde_json::to_string(&trail).ok(),
+                                error: Some(last_err.clone()),
+                                ..Default::default()
+                            });
                             return error_response(status, &last_err);
                         }
                         _ => break, // Retries erschöpft oder Provider erschöpft -> nächstes Modell
@@ -282,7 +317,7 @@ async fn forward_with_retries(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_success(
-    state: &AppState,
+    state: &Arc<AppState>,
     resp: reqwest::Response,
     entry: &ModelEntry,
     plan: &Plan,
@@ -301,33 +336,29 @@ async fn handle_success(
     let trail_json = serde_json::to_string(&trail).ok();
 
     if is_stream {
-        let est_cost = entry.est_cost(input_tokens, plan.expected_output);
-        let _ = state.store.insert(&RequestLog {
-            tool: tool.into(),
-            session: session.clone(),
-            task_type: task_key.into(),
-            model: entry.model.clone(),
-            provider: entry.provider.clone(),
-            tier: plan.tier,
-            used_fallback,
-            degraded: plan.degraded,
-            budget_pressure: plan.pressure,
-            estimated_tokens: input_tokens,
-            prompt_tokens: input_tokens,
-            completion_tokens: plan.expected_output,
-            estimated_cost_usd: est_cost,
-            real_cost_usd: est_cost,
-            latency_ms: started.elapsed().as_millis() as u64,
-            status: status.as_u16(),
-            attempts,
-            attempt_trail: trail_json,
-            ..Default::default()
-        });
-        return Response::builder()
-            .status(status)
-            .header("content-type", "text/event-stream")
-            .body(Body::from_stream(resp.bytes_stream()))
-            .unwrap();
+        // Bytes durchreichen, parallel akkumulieren; am Stream-Ende reale Usage
+        // aus dem finalen Chunk loggen und (falls cachebar) die SSE-Antwort ablegen.
+        return stream_response(
+            Arc::clone(state),
+            resp,
+            status,
+            StreamCtx {
+                entry: entry.clone(),
+                tier: plan.tier,
+                degraded: plan.degraded,
+                pressure: plan.pressure,
+                expected_output: plan.expected_output,
+                task_key: task_key.to_string(),
+                tool: tool.to_string(),
+                session: session.clone(),
+                used_fallback,
+                input_tokens,
+                attempts,
+                trail_json,
+                cache_key,
+                started,
+            },
+        );
     }
 
     let payload: Value = match resp.json().await {
@@ -393,6 +424,174 @@ async fn handle_success(
     );
 
     (status, Json(payload)).into_response()
+}
+
+/// Eigentümer-Kontext für das verzögerte Logging/Caching einer Streaming-Antwort,
+/// die nach Rückkehr des Handlers weiter gepollt wird.
+struct StreamCtx {
+    entry: ModelEntry,
+    tier: u8,
+    degraded: bool,
+    pressure: f64,
+    expected_output: u64,
+    task_key: String,
+    tool: String,
+    session: Option<String>,
+    used_fallback: bool,
+    input_tokens: u64,
+    attempts: u32,
+    trail_json: Option<String>,
+    cache_key: Option<String>,
+    started: Instant,
+}
+
+/// Baut die SSE-Antwort: leitet jeden Chunk durch und akkumuliert ihn. Am Ende
+/// des Upstream-Streams wird `finalize_stream` aufgerufen (reale Usage + Cache).
+fn stream_response(
+    app: Arc<AppState>,
+    resp: reqwest::Response,
+    status: StatusCode,
+    ctx: StreamCtx,
+) -> Response {
+    let init = (Box::pin(resp.bytes_stream()), Vec::<u8>::new(), app, ctx, false);
+    let stream = futures_util::stream::unfold(
+        init,
+        |(mut up, mut acc, app, ctx, finished)| async move {
+            if finished {
+                return None;
+            }
+            match up.next().await {
+                Some(Ok(chunk)) => {
+                    acc.extend_from_slice(&chunk);
+                    Some((Ok::<_, reqwest::Error>(chunk), (up, acc, app, ctx, false)))
+                }
+                Some(Err(e)) => {
+                    finalize_stream(&app, &acc, &ctx, Some(e.to_string()));
+                    Some((Err(e), (up, acc, app, ctx, true)))
+                }
+                None => {
+                    finalize_stream(&app, &acc, &ctx, None);
+                    None
+                }
+            }
+        },
+    );
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Parst die akkumulierte SSE nach realer Usage und finish_reason, loggt den
+/// Request und legt bei Erfolg die vollständige SSE-Antwort im Cache ab.
+fn finalize_stream(app: &AppState, acc: &[u8], ctx: &StreamCtx, stream_err: Option<String>) {
+    let (pt, ct, finish) = parse_stream_usage(acc);
+    let prompt_tokens = pt.unwrap_or(ctx.input_tokens);
+    let completion_tokens = ct.unwrap_or(0);
+    let real_cost = ctx.entry.est_cost(prompt_tokens, completion_tokens);
+
+    if stream_err.is_none() {
+        if let Some(key) = &ctx.cache_key {
+            let body = String::from_utf8_lossy(acc).into_owned();
+            app.store
+                .cache_store(key, &ctx.entry.model, &body, app.cfg.cache.ttl_seconds);
+        }
+    }
+
+    let _ = app.store.insert(&RequestLog {
+        tool: ctx.tool.clone(),
+        session: ctx.session.clone(),
+        task_type: ctx.task_key.clone(),
+        model: ctx.entry.model.clone(),
+        provider: ctx.entry.provider.clone(),
+        tier: ctx.tier,
+        used_fallback: ctx.used_fallback,
+        degraded: ctx.degraded,
+        budget_pressure: ctx.pressure,
+        estimated_tokens: ctx.input_tokens,
+        prompt_tokens,
+        completion_tokens,
+        estimated_cost_usd: ctx.entry.est_cost(ctx.input_tokens, ctx.expected_output),
+        real_cost_usd: real_cost,
+        latency_ms: ctx.started.elapsed().as_millis() as u64,
+        status: if stream_err.is_some() { StatusCode::BAD_GATEWAY.as_u16() } else { 200 },
+        attempts: ctx.attempts,
+        attempt_trail: ctx.trail_json.clone(),
+        stop_reason: finish,
+        error: stream_err,
+        ..Default::default()
+    });
+}
+
+/// Extrahiert prompt-/completion_tokens und finish_reason aus einer SSE-Antwort.
+/// Der letzte `data:`-Chunk mit `usage` gewinnt (include_usage liefert ihn am Ende).
+fn parse_stream_usage(acc: &[u8]) -> (Option<u64>, Option<u64>, Option<String>) {
+    let text = String::from_utf8_lossy(acc);
+    let mut prompt = None;
+    let mut completion = None;
+    let mut finish = None;
+    for line in text.lines() {
+        let Some(payload) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        if let Some(p) = v.pointer("/usage/prompt_tokens").and_then(Value::as_u64) {
+            prompt = Some(p);
+        }
+        if let Some(c) = v.pointer("/usage/completion_tokens").and_then(Value::as_u64) {
+            completion = Some(c);
+        }
+        if let Some(f) = v.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
+            finish = Some(f.to_string());
+        }
+    }
+    (prompt, completion, finish)
+}
+
+/// Cache-Treffer für eine Streaming-Anfrage: gespeicherte SSE als Stream zurückspielen.
+#[allow(clippy::too_many_arguments)]
+fn cache_hit_stream_response(
+    state: &AppState,
+    entry: &ModelEntry,
+    plan: &Plan,
+    task_key: &str,
+    tool: &str,
+    session: &Option<String>,
+    cached: String,
+    started: Instant,
+) -> Response {
+    let (pt, ct, _) = parse_stream_usage(cached.as_bytes());
+    let _ = state.store.insert(&RequestLog {
+        tool: tool.into(),
+        session: session.clone(),
+        task_type: task_key.into(),
+        model: entry.model.clone(),
+        provider: entry.provider.clone(),
+        tier: plan.tier,
+        budget_pressure: plan.pressure,
+        prompt_tokens: pt.unwrap_or(0),
+        completion_tokens: ct.unwrap_or(0),
+        latency_ms: started.elapsed().as_millis() as u64,
+        status: 200,
+        cache_hit: true,
+        ..Default::default()
+    });
+
+    tracing::info!(task = task_key, model = %entry.model, "cache hit (stream)");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("x-llmux-cache", "hit")
+        .body(Body::from(cached))
+        .unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -469,8 +668,22 @@ fn check_auth(cfg: &Config, headers: &HeaderMap) -> bool {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|token| token == expected)
+        .map(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
+}
+
+/// Konstantzeit-Vergleich gegen Timing-Seitenkanäle beim API-Key-Vergleich.
+/// Die Länge gilt nicht als geheim; bei gleicher Länge wird ohne Early-Exit
+/// über alle Bytes akkumuliert.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn header(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -576,11 +789,130 @@ mod tests {
     }
 
     #[test]
+    fn constant_time_eq_matches_semantics() {
+        assert!(constant_time_eq(b"secret-key", b"secret-key"));
+        assert!(!constant_time_eq(b"secret-key", b"secret-keX"));
+        assert!(!constant_time_eq(b"short", b"longer-key"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn parses_usage_from_sse_stream() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}\n\n\
+                   data: [DONE]\n\n";
+        let (p, c, f) = parse_stream_usage(sse.as_bytes());
+        assert_eq!(p, Some(12));
+        assert_eq!(c, Some(7));
+        assert_eq!(f.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn parse_usage_tolerates_missing_usage() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let (p, c, _) = parse_stream_usage(sse.as_bytes());
+        assert_eq!(p, None);
+        assert_eq!(c, None);
+    }
+
+    #[test]
     fn status_classification() {
         assert!(matches!(classify_status(StatusCode::INTERNAL_SERVER_ERROR), Outcome::Transient));
         assert!(matches!(classify_status(StatusCode::TOO_MANY_REQUESTS), Outcome::Transient));
         assert!(matches!(classify_status(StatusCode::UNAUTHORIZED), Outcome::ProviderExhausted));
         assert!(matches!(classify_status(StatusCode::PAYMENT_REQUIRED), Outcome::ProviderExhausted));
         assert!(matches!(classify_status(StatusCode::BAD_REQUEST), Outcome::BadRequest));
+    }
+
+    /// End-to-End über einen Mock-Provider: Streaming reicht SSE durch, loggt reale
+    /// Usage (T2.1) und cached die Antwort; die zweite identische Anfrage kommt aus
+    /// dem Cache, ohne den Provider erneut zu treffen (T2.2).
+    #[tokio::test]
+    async fn streaming_logs_real_usage_and_serves_from_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+            data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+            data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\n\
+            data: [DONE]\n\n";
+
+        // Mock-Provider: zählt Aufrufe, antwortet mit fester SSE.
+        let mock = {
+            let hits = hits.clone();
+            Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        ([("content-type", "text/event-stream")], SSE)
+                    }
+                }),
+            )
+        };
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+        // llmux mit Cache an, ein lokales tier-1-Modell, das auf den Mock zeigt.
+        let yaml = format!(
+            r#"
+server: {{ host: "127.0.0.1", port: 0 }}
+cache: {{ enabled: true, ttl_seconds: 600, max_conversation_messages: 5, eviction_interval_seconds: 300 }}
+providers:
+  mock: {{ enabled: true, base_url: "http://{mock_addr}", local: true }}
+models:
+  - {{ provider: mock, model: "m1", tier: 1, context: 8000, supports_tools: true, input_per_mtok: 1.0, output_per_mtok: 1.0 }}
+classification:
+  simple_text:       {{ min_tier: 1 }}
+  summarize:         {{ min_tier: 1 }}
+  code_review:       {{ min_tier: 1 }}
+  architecture:      {{ min_tier: 1 }}
+  private_sensitive: {{ min_tier: 1, local_only: true }}
+"#
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let state = Arc::new(AppState {
+            cfg,
+            http: reqwest::Client::new(),
+            store: Store::open(":memory:").unwrap(),
+            sessions: SessionStore::default(),
+        });
+        let app = build_router(state.clone());
+        let llmux_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llmux_addr = llmux_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(llmux_listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{llmux_addr}/v1/chat/completions");
+        let body = json!({ "stream": true, "messages": [{ "role": "user", "content": "hello" }] });
+
+        // 1. Anfrage: Provider-Aufruf, SSE durchgereicht, kein Cache-Header.
+        let r1 = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(r1.status(), 200);
+        assert!(r1.headers().get("x-llmux-cache").is_none());
+        let chunk = r1.text().await.unwrap();
+        assert!(chunk.contains("[DONE]"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // T2.1: am Stream-Ende wurde reale Usage geloggt (11/5), Status 200.
+        // Kurzer Yield, damit der Insert sicher abgeschlossen ist.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (status, pt, ct, cost, cache_hit) = state.store.last_request().unwrap();
+        assert_eq!((status, pt, ct, cache_hit), (200, 11, 5, 0));
+        assert!(cost > 0.0, "real_cost_usd muss > 0 sein, war {cost}");
+
+        // 2. identische Anfrage: Cache-Treffer, Provider wird NICHT erneut aufgerufen.
+        let r2 = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(r2.status(), 200);
+        assert_eq!(
+            r2.headers().get("x-llmux-cache").and_then(|v| v.to_str().ok()),
+            Some("hit")
+        );
+        let replay = r2.text().await.unwrap();
+        assert!(replay.contains("[DONE]"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "Cache-Treffer darf den Provider nicht erneut treffen");
     }
 }

@@ -53,6 +53,11 @@ pub struct CacheConfig {
     /// Ab dieser History-Länge wird nicht mehr gecacht (lange Agent-Loops matchen kaum
     /// und produzieren falsche Treffer).
     pub max_conversation_messages: usize,
+    /// Obergrenze der Cache-Zeilen. None = unbegrenzt (nur TTL-basierte Eviction).
+    #[serde(default)]
+    pub max_entries: Option<usize>,
+    /// Intervall des Hintergrund-Sweeps (abgelaufene Einträge + Zeilenlimit).
+    pub eviction_interval_seconds: u64,
 }
 
 impl Default for CacheConfig {
@@ -61,6 +66,8 @@ impl Default for CacheConfig {
             enabled: false,
             ttl_seconds: 1800,
             max_conversation_messages: 3,
+            max_entries: None,
+            eviction_interval_seconds: 300,
         }
     }
 }

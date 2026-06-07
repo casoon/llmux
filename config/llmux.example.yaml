@@ -29,6 +29,10 @@ cache:
   enabled: true
   ttl_seconds: 1800
   max_conversation_messages: 3
+  # Hintergrund-Eviction: abgelaufene Einträge werden alle N Sekunden gelöscht.
+  eviction_interval_seconds: 300
+  # Optionales Zeilenlimit; älteste Einträge fallen zuerst raus. Weglassen = unbegrenzt.
+  max_entries: 10000
 
 privacy:
   local_first: true

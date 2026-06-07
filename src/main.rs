@@ -48,6 +48,28 @@ async fn main() -> anyhow::Result<()> {
         sessions: router::SessionStore::default(),
     });
 
+    // Hintergrund-Eviction: abgelaufene Cache-Einträge + optionales Zeilenlimit.
+    if state.cfg.cache.enabled {
+        let evict = state.clone();
+        tokio::spawn(async move {
+            let secs = evict.cfg.cache.eviction_interval_seconds.max(1);
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+            loop {
+                tick.tick().await;
+                let expired = evict.store.evict_expired_cache();
+                let capped = evict
+                    .cfg
+                    .cache
+                    .max_entries
+                    .map(|m| evict.store.enforce_cache_cap(m))
+                    .unwrap_or(0);
+                if expired + capped > 0 {
+                    tracing::debug!(expired, capped, "cache eviction");
+                }
+            }
+        });
+    }
+
     let app = api::build_router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("llmux läuft auf http://{addr}");
