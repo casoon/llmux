@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use crate::config::{Config, ModelEntry, ProviderKind, RetryConfig};
 use crate::logging::{RequestLog, Store};
 use crate::router::{self, SelectError, SelectInput, SessionStore};
-use crate::{cache, classifier, cost, providers};
+use crate::{cache, classifier, cost, privacy, providers};
 
 pub struct AppState {
     pub cfg: Config,
@@ -88,13 +88,25 @@ async fn chat_completions(
 
     // Request verstehen
     let input_tokens = cost::estimate_request_tokens(&body);
+    let cached_prefix_tokens = cost::estimate_cached_prefix_tokens(&body);
     let requires_tools = classifier::requires_tools(&body);
-    let text = extract_text(&body);
-    let task = classifier::classify(&text, &state.cfg.privacy.block_cloud_patterns);
+    // Privacy prüft eine breitere Oberfläche (User-/Tool-Content + Tool-Schemas) als
+    // die Keyword-Klassifikation, die nur die letzte(n) User-Message(s) betrachtet
+    // (#22/#23). Privacy hat Vorrang und erzwingt private_sensitive (-> local_only).
+    let task = if privacy::request_is_sensitive(
+        &body,
+        &state.cfg.privacy.block_cloud_patterns,
+        state.cfg.privacy.scan_system,
+    ) {
+        classifier::TaskType::PrivateSensitive
+    } else {
+        let user_text = extract_user_text(&body, state.cfg.classifier.user_messages);
+        classifier::classify(&user_text)
+    };
     let task_key = task.as_key();
 
     // Plan bestimmen: erzwungenes Modell oder dynamische Auswahl
-    let mut plan = match build_plan(&state, &force_model, task_key, requires_tools, input_tokens, &session) {
+    let mut plan = match build_plan(&state, &force_model, task_key, requires_tools, input_tokens, cached_prefix_tokens, &session) {
         Ok(p) => p,
         Err(resp) => {
             log_failure(&state.store, &tool, &session, task_key, input_tokens, "plan", resp.0.as_u16(), &resp.1);
@@ -115,9 +127,11 @@ async fn chat_completions(
         return error_response(StatusCode::BAD_REQUEST, msg);
     }
 
-    // Per-Request-Kostendeckel
+    // Per-Request-Kostendeckel (mit Prefix-Rabatt, konsistent zur Routing-Schätzung).
     if let Some(mc) = max_cost {
-        let est = primary.est_cost(input_tokens, plan.expected_output);
+        let billed = state.cfg.prompt_cache_billed_fraction(&primary.provider);
+        let eff_input = cost::effective_input_tokens(input_tokens, cached_prefix_tokens, billed);
+        let est = primary.est_cost(eff_input, plan.expected_output);
         if est > mc {
             let msg = format!("Schätzkosten {est:.5} USD über max-cost {mc:.5}");
             log_failure(&state.store, &tool, &session, task_key, input_tokens, "max_cost", 402, &msg);
@@ -161,12 +175,14 @@ async fn chat_completions(
 }
 
 /// Baut den Plan: entweder erzwungenes Modell (Header) oder dynamische Auswahl.
+#[allow(clippy::too_many_arguments)]
 fn build_plan(
     state: &AppState,
     force_model: &Option<String>,
     task_key: &str,
     requires_tools: bool,
     input_tokens: u64,
+    cached_prefix_tokens: u64,
     session: &Option<String>,
 ) -> Result<Plan, (StatusCode, String)> {
     if let Some(name) = force_model {
@@ -194,6 +210,7 @@ fn build_plan(
         task_key,
         requires_tools,
         input_tokens,
+        cached_prefix_tokens,
         session: session.as_deref(),
     };
     match router::select(&state.cfg, &state.store, &state.sessions, &select_input) {
@@ -756,30 +773,42 @@ fn header_bool(headers: &HeaderMap, name: &str) -> bool {
     )
 }
 
-/// Extrahiert allen Text aus messages[].content (String oder OpenAI-Content-Parts).
-fn extract_text(body: &Value) -> String {
+/// Text der letzten `n` `user`-Messages (mind. 1), für die regelbasierte
+/// Klassifikation. System-/Assistant-/Tool-Rollen bleiben außen vor, damit der
+/// große statische Prefix von Agent-Clients den `task_type` nicht verzerrt (#22).
+fn extract_user_text(body: &Value, n: usize) -> String {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return String::new();
     };
+    let users: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .collect();
+    let start = users.len().saturating_sub(n.max(1));
     let mut out = String::new();
-    for msg in messages {
-        match msg.get("content") {
-            Some(Value::String(s)) => {
-                out.push_str(s);
-                out.push('\n');
-            }
-            Some(Value::Array(parts)) => {
-                for part in parts {
-                    if let Some(t) = part.get("text").and_then(Value::as_str) {
-                        out.push_str(t);
-                        out.push('\n');
-                    }
-                }
-            }
-            _ => {}
-        }
+    for msg in &users[start..] {
+        push_content(&mut out, msg.get("content"));
     }
     out
+}
+
+/// Hängt den Text-Content einer Message an `out` an (String oder OpenAI-Content-Parts).
+fn push_content(out: &mut String, content: Option<&Value>) {
+    match content {
+        Some(Value::String(s)) => {
+            out.push_str(s);
+            out.push('\n');
+        }
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(Value::as_str) {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -842,6 +871,40 @@ mod tests {
         let capped = backoff_ms(&cfg, 20);
         assert!(capped >= (8000.0 * 0.8) as u64, "untere Jitter-Grenze verletzt: {capped}");
         assert!(capped <= (8000.0 * 1.2) as u64, "Deckel verletzt: {capped}");
+    }
+
+    // #22: Ein großer statischer System-Prefix voller Architektur-Keywords darf den
+    // task_type nicht verzerren — klassifiziert wird die kurze User-Aufgabe.
+    #[test]
+    fn classifies_by_latest_user_message_not_system_prefix() {
+        let body = json!({
+            "messages": [
+                { "role": "system", "content": "You are an expert in software architecture, \
+                  database schema design, scalability and security trade-offs. Tools available: ..." },
+                { "role": "user", "content": "fix the bug in this function" }
+            ]
+        });
+        let user_text = extract_user_text(&body, 1);
+        assert_eq!(classifier::classify(&user_text), classifier::TaskType::CodeReview);
+        // Über die gesamte Payload würde fälschlich Architecture gewinnen.
+        assert_eq!(
+            classifier::classify(&extract_user_text(&body, 99)),
+            classifier::TaskType::CodeReview
+        );
+    }
+
+    #[test]
+    fn extract_user_text_respects_message_count() {
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": "first" },
+                { "role": "assistant", "content": "reply" },
+                { "role": "user", "content": "second" }
+            ]
+        });
+        assert_eq!(extract_user_text(&body, 1).trim(), "second");
+        let two = extract_user_text(&body, 2);
+        assert!(two.contains("first") && two.contains("second"));
     }
 
     #[test]

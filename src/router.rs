@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::config::{Config, ModelEntry};
+use crate::cost;
 use crate::logging::Store;
 
 /// In-Memory-Gedächtnis pro Agent-Session (Tool-Call-Konsistenz im Loop).
@@ -49,6 +50,9 @@ pub struct SelectInput<'a> {
     pub task_key: &'a str,
     pub requires_tools: bool,
     pub input_tokens: u64,
+    /// Cachebarer Prompt-Prefix (Teilmenge von `input_tokens`). Wird bei Providern
+    /// mit Prompt-Caching für die Kostenschätzung rabattiert (#24).
+    pub cached_prefix_tokens: u64,
     pub session: Option<&'a str>,
 }
 
@@ -114,12 +118,22 @@ pub fn select(
         )));
     }
 
+    // Geschätzte Kosten eines Kandidaten. Bei Providern mit Prompt-Caching wird der
+    // wiederholte Prefix rabattiert, damit der große statische Anteil das Ranking
+    // und die Budget-Schranke nicht verzerrt (#24). Reale Abrechnung bleibt unberührt.
+    let est_cost = |m: &ModelEntry| {
+        let billed = cfg.prompt_cache_billed_fraction(&m.provider);
+        let eff_input =
+            cost::effective_input_tokens(input.input_tokens, input.cached_prefix_tokens, billed);
+        m.est_cost(eff_input, expected_output)
+    };
+
     // Kostenoptimierung: günstigstes Modell zuerst. Bei Gleichstand ggf. lokale
     // Modelle bevorzugen (local_first), dann höheres Tier.
     let local_first = cfg.privacy.local_first;
     candidates.sort_by(|a, b| {
-        let ca = a.est_cost(input.input_tokens, expected_output);
-        let cb = b.est_cost(input.input_tokens, expected_output);
+        let ca = est_cost(a);
+        let cb = est_cost(b);
         ca.partial_cmp(&cb)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
@@ -151,7 +165,7 @@ pub fn select(
     let remaining = remaining_budget(cfg, store);
     let chain: Vec<ModelEntry> = candidates
         .iter()
-        .filter(|m| m.est_cost(input.input_tokens, expected_output) <= remaining)
+        .filter(|m| est_cost(m) <= remaining)
         .map(|m| (*m).clone())
         .collect();
 
@@ -250,8 +264,8 @@ classification:
         Store::open(":memory:").expect("in-memory db")
     }
 
-    fn input<'a>(task_key: &'a str, requires_tools: bool, input_tokens: u64) -> SelectInput<'a> {
-        SelectInput { task_key, requires_tools, input_tokens, session: None }
+    fn input(task_key: &str, requires_tools: bool, input_tokens: u64) -> SelectInput<'_> {
+        SelectInput { task_key, requires_tools, input_tokens, cached_prefix_tokens: 0, session: None }
     }
 
     fn spend(store: &Store, usd: f64) {
@@ -336,12 +350,48 @@ classification:
     }
 
     #[test]
+    fn prompt_cache_discount_flips_ranking() {
+        // Zwei tool-fähige Tier-3-Modelle: 'plain' ist pro Token günstiger, 'cached'
+        // teurer — aber mit Prompt-Caching. Bei großem wiederholtem Prefix gewinnt
+        // 'cached', weil der marginale Anteil rabattiert geschätzt wird (#24).
+        let yaml = r#"
+server: { host: "127.0.0.1", port: 0 }
+providers:
+  plain:  { enabled: true, base_url: "https://a/v1" }
+  cached: { enabled: true, base_url: "https://b/v1", prompt_caching: true, cache_billed_fraction: 0.1 }
+models:
+  - { provider: plain,  model: "plain-m",  tier: 3, context: 200000, supports_tools: true, input_per_mtok: 1.0, output_per_mtok: 0.0 }
+  - { provider: cached, model: "cached-m", tier: 3, context: 200000, supports_tools: true, input_per_mtok: 2.0, output_per_mtok: 0.0 }
+classification:
+  simple_text:       { min_tier: 3, expected_output_ratio: 0.0 }
+  summarize:         { min_tier: 3 }
+  code_review:       { min_tier: 3 }
+  architecture:      { min_tier: 3 }
+  private_sensitive: { min_tier: 3 }
+"#;
+        let c: Config = serde_yaml::from_str(yaml).expect("fixture parses");
+        let s = store();
+        // 10k Input, davon 9k gecachter Prefix.
+        let cached_in = SelectInput {
+            task_key: "simple_text", requires_tools: false,
+            input_tokens: 10_000, cached_prefix_tokens: 9_000, session: None,
+        };
+        let sel = select(&c, &s, &SessionStore::default(), &cached_in).unwrap();
+        assert_eq!(sel.chain[0].model, "cached-m");
+
+        // Ohne gecachten Prefix gewinnt wieder das pro Token günstigere Modell.
+        let no_prefix = SelectInput { cached_prefix_tokens: 0, ..cached_in };
+        let sel = select(&c, &s, &SessionStore::default(), &no_prefix).unwrap();
+        assert_eq!(sel.chain[0].model, "plain-m");
+    }
+
+    #[test]
     fn session_stickiness_prefers_prior_choice() {
         let c = cfg("");
         let s = store();
         let sessions = SessionStore::default();
         sessions.set("s1", "cloud_p", "mid", 3);
-        let inp = SelectInput { task_key: "simple_text", requires_tools: false, input_tokens: 100, session: Some("s1") };
+        let inp = SelectInput { task_key: "simple_text", requires_tools: false, input_tokens: 100, cached_prefix_tokens: 0, session: Some("s1") };
         let sel = select(&c, &s, &sessions, &inp).unwrap();
         // Trotz günstigerem local-small bleibt der Loop bei mid.
         assert_eq!(sel.chain[0].model, "mid");

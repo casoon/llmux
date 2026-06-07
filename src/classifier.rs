@@ -1,7 +1,6 @@
 //! Regelbasierte Analyse des Requests: task_type + agentische Merkmale (Tool-Use).
 //! Später ersetzbar durch ein kleines lokales Klassifikationsmodell.
 
-use crate::privacy;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,12 +34,11 @@ impl TaskType {
     }
 }
 
-/// Klassifiziert anhand von Schlüsselwörtern. Privacy hat Vorrang.
-pub fn classify(text: &str, patterns: &[String]) -> TaskType {
-    if privacy::contains_sensitive(text, patterns) {
-        return TaskType::PrivateSensitive;
-    }
-
+/// Klassifiziert anhand von Schlüsselwörtern. Der `PrivateSensitive`-Fall wird
+/// nicht hier, sondern aufrufseitig anhand des Privacy-Scans gesetzt (siehe
+/// `privacy::request_is_sensitive`), da Privacy eine breitere Request-Oberfläche
+/// prüft als die hier verwendete (zuletzt eingegangene User-Nachricht).
+pub fn classify(text: &str) -> TaskType {
     let t = text.to_lowercase();
 
     if contains_any(
@@ -117,24 +115,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn classify_plain(text: &str) -> TaskType {
-        classify(text, &[])
-    }
-
     #[test]
     fn classifies_each_task_type() {
-        assert_eq!(classify_plain("Erkläre mir die Architektur dieses Systems"), TaskType::Architecture);
-        assert_eq!(classify_plain("Bitte refactor diese function"), TaskType::CodeReview);
-        assert_eq!(classify_plain("Fasse zusammen, worum es geht"), TaskType::Summarize);
-        assert_eq!(classify_plain("Wie ist das Wetter heute?"), TaskType::SimpleText);
-    }
-
-    #[test]
-    fn privacy_overrides_everything() {
-        let patterns = vec!["PRIVATE_KEY".to_string()];
-        // Inhalt wäre sonst CodeReview ("function"), Privacy gewinnt.
-        let t = classify("function with PRIVATE_KEY embedded", &patterns);
-        assert_eq!(t, TaskType::PrivateSensitive);
+        assert_eq!(classify("Erkläre mir die Architektur dieses Systems"), TaskType::Architecture);
+        assert_eq!(classify("Bitte refactor diese function"), TaskType::CodeReview);
+        assert_eq!(classify("Fasse zusammen, worum es geht"), TaskType::Summarize);
+        assert_eq!(classify("Wie ist das Wetter heute?"), TaskType::SimpleText);
     }
 
     #[test]

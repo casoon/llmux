@@ -27,6 +27,23 @@ pub struct Config {
     pub retry: RetryConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub classifier: ClassifierConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClassifierConfig {
+    /// Anzahl der letzten `user`-Messages, über die der regelbasierte Klassifikator
+    /// den `task_type` bestimmt. System-/Assistant-/Tool-Rollen bleiben außen vor,
+    /// damit der große statische Prefix von Agent-Clients die Wahl nicht verzerrt (#22).
+    pub user_messages: usize,
+}
+
+impl Default for ClassifierConfig {
+    fn default() -> Self {
+        Self { user_messages: 1 }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +131,11 @@ pub struct PrivacyConfig {
     pub local_first: bool,
     #[serde(default)]
     pub block_cloud_patterns: Vec<String>,
+    /// Auch statisch injizierten `system`-/`assistant`-Content gegen die Patterns
+    /// scannen. Standard `false`: dieser Kontext ist Client-Boilerplate, kein
+    /// User-Payload, und würde sonst spurious `local_only` erzwingen (#23).
+    #[serde(default)]
+    pub scan_system: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +160,15 @@ pub struct ProviderConfig {
     /// Weiterleiten entfernt werden (z. B. `frequency_penalty` bei manchen Backends).
     #[serde(default)]
     pub strip_params: Vec<String>,
+    /// Provider cached wiederholte Prompt-Prefixe (Anthropic `cache_control`,
+    /// OpenAI automatisches Prefix-Caching). Aktiviert den Prefix-Rabatt in der
+    /// Routing-Kostenschätzung (#24) — die reale Kostenabrechnung bleibt unberührt.
+    #[serde(default)]
+    pub prompt_caching: bool,
+    /// Anteil, zu dem der gecachte Prefix bei der Routing-Schätzung berechnet wird
+    /// (0.0–1.0). Default 0.1 ≈ Anthropic Cache-Read. Greift nur bei `prompt_caching`.
+    #[serde(default = "default_cache_billed_fraction")]
+    pub cache_billed_fraction: f64,
 }
 
 /// Ein API-Key-Slot eines Providers (Env-Variable + Gewicht + Modellfilter).
@@ -158,6 +189,10 @@ pub struct ProviderKey {
 
 fn default_weight() -> f64 {
     1.0
+}
+
+fn default_cache_billed_fraction() -> f64 {
+    0.1
 }
 
 /// Backend-Protokoll eines Providers.
@@ -262,6 +297,16 @@ impl Config {
 
     pub fn provider_kind(&self, provider: &str) -> ProviderKind {
         self.providers.get(provider).map(|p| p.kind).unwrap_or_default()
+    }
+
+    /// Anteil, zu dem der gecachte Prompt-Prefix bei der Routing-Schätzung berechnet
+    /// wird. `1.0` (voller Preis), wenn der Provider kein Prompt-Caching nutzt (#24).
+    pub fn prompt_cache_billed_fraction(&self, provider: &str) -> f64 {
+        self.providers
+            .get(provider)
+            .filter(|p| p.prompt_caching)
+            .map(|p| p.cache_billed_fraction.clamp(0.0, 1.0))
+            .unwrap_or(1.0)
     }
 
     /// Löst einen logischen Modell-Alias auf das Zielmodell auf (None = kein Alias).

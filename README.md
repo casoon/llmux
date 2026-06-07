@@ -131,8 +131,9 @@ See `config/llmux.example.yaml`. Key sections:
 - `budgets` — `daily_max_usd`, `monthly_max_usd` and `pressure_downgrade` (tier throttling)
 - `retry` — `max_retries`, `backoff_initial_ms`, `backoff_max_ms`
 - `cache` — `enabled`, `ttl_seconds`, `max_conversation_messages` (history guard), `eviction_interval_seconds`, optional `max_entries` (row cap)
-- `privacy.block_cloud_patterns` — triggers for local-only routing
-- `providers` — backends including `local: true` for local providers (Ollama), `kind: anthropic` for the native Anthropic adapter (translates to `/v1/messages`; non-streaming), `strip_params` to drop request fields the backend doesn't support (also per-model on `models[]`), and `keys` for multiple weighted API keys (weighted-random selection; rotate on `401/402/403/429` before model fallback)
+- `classifier.user_messages` — number of latest `user` messages the rule-based classifier derives `task_type` from (default `1`); the large static agent-client prefix (system prompt, tool schemas, history) is excluded so it doesn't skew the quality floor
+- `privacy.block_cloud_patterns` — triggers for local-only routing. Scan surface: user/tool message content **and** tool/function schemas. `privacy.scan_system` (default `false`) additionally scans injected `system`/`assistant` content — off by default so client boilerplate doesn't spuriously force `local_only`
+- `providers` — backends including `local: true` for local providers (Ollama), `kind: anthropic` for the native Anthropic adapter (translates to `/v1/messages`; non-streaming), `strip_params` to drop request fields the backend doesn't support (also per-model on `models[]`), `keys` for multiple weighted API keys (weighted-random selection; rotate on `401/402/403/429` before model fallback), and `prompt_caching` + `cache_billed_fraction` (default `0.1`) to discount the repeated prompt prefix in the **routing** cost estimate (real billing is unchanged)
 
 ## Querying Logs
 

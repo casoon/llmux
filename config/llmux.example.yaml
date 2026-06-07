@@ -37,6 +37,7 @@ cache:
 privacy:
   local_first: true
   # Wird ein Pattern erkannt -> task_type private_sensitive (-> nur lokale Provider).
+  # Gescannt werden User-/Tool-Message-Content UND die Tool-/Function-Schemas.
   block_cloud_patterns:
     - ".env"
     - "PRIVATE_KEY"
@@ -44,6 +45,15 @@ privacy:
     - "BEGIN RSA"
     - "password"
     - "secret"
+  # Auch statisch injizierten system-/assistant-Content scannen. Standard false:
+  # dieser Kontext ist Client-Boilerplate, kein User-Payload, und würde sonst
+  # spurious local_only erzwingen (#23).
+  scan_system: false
+
+# Regelbasierte Klassifikation: task_type wird nur aus den letzten user-Messages
+# bestimmt, nicht aus dem großen statischen Prefix der Agent-Clients (#22).
+classifier:
+  user_messages: 1
 
 providers:
   openrouter:
@@ -73,6 +83,10 @@ providers:
     kind: anthropic
     base_url: "https://api.anthropic.com/v1"
     api_key_env: "ANTHROPIC_API_KEY"
+    # Provider cached wiederholte Prompt-Prefixe -> die Routing-Kostenschätzung
+    # rabattiert den großen statischen Prefix (#24). Reale Abrechnung unverändert.
+    prompt_caching: true
+    cache_billed_fraction: 0.1   # gecachter Prefix ~10 % (Anthropic Cache-Read)
 
 # Modell-Katalog: der Selektor wählt daraus dynamisch das günstigste Modell,
 # das Tier-Floor, Tool-Bedarf, Kontextgröße, Privacy und Budget erfüllt.

@@ -1,4 +1,7 @@
 /target
+/node_modules
+/dist
+/.astro
 /data/*.sqlite
 /data/*.sqlite-*
 .env
