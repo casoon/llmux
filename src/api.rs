@@ -15,7 +15,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::config::{Config, ModelEntry, RetryConfig};
+use crate::config::{Config, ModelEntry, ProviderKind, RetryConfig};
 use crate::logging::{RequestLog, Store};
 use crate::router::{self, SelectError, SelectInput, SessionStore};
 use crate::{cache, classifier, cost, providers};
@@ -38,9 +38,9 @@ struct Plan {
 
 /// Klassifikation eines Provider-Fehlers für die Retry-/Fallback-Strategie.
 enum Outcome {
-    Transient,         // 5xx/429/Netzwerk -> gleiches Modell erneut (mit Backoff)
-    ProviderExhausted, // 401/402/403 -> nächstes Modell, kein Retry
-    BadRequest,        // sonstige 4xx -> Abbruch, kein Fallback (Request ist fehlerhaft)
+    Transient,    // 5xx/408 -> gleicher Key erneut (mit Backoff), dann nächstes Modell
+    KeyExhausted, // 401/402/403/429 -> nächster Key, dann nächstes Modell
+    BadRequest,   // sonstige 4xx -> Abbruch, kein Fallback (Request ist fehlerhaft)
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -71,8 +71,17 @@ async fn chat_completions(
         }
     }
 
-    // Per-Request-Overrides
-    let force_model = header(&headers, "x-llmux-model");
+    // Per-Request-Overrides. x-llmux-model erzwingt direkt (Alias wird aufgelöst);
+    // das `model`-Feld des Requests erzwingt nur, wenn es ein definierter Alias ist
+    // (sonst greift wie bisher die dynamische Auswahl).
+    let force_model = match header(&headers, "x-llmux-model") {
+        Some(m) => Some(state.cfg.resolve_alias(&m).unwrap_or(&m).to_string()),
+        None => body
+            .get("model")
+            .and_then(Value::as_str)
+            .and_then(|m| state.cfg.resolve_alias(m))
+            .map(String::from),
+    };
     let no_cache = header_bool(&headers, "x-llmux-no-cache");
     let no_fallback = header_bool(&headers, "x-llmux-no-fallback");
     let max_cost = header(&headers, "x-llmux-max-cost").and_then(|s| s.parse::<f64>().ok());
@@ -98,6 +107,13 @@ async fn chat_completions(
     }
 
     let primary = plan.chain[0].clone();
+
+    // Streaming für native Anthropic-Provider ist noch nicht implementiert (nur Nicht-Stream).
+    if is_stream && state.cfg.provider_kind(&primary.provider) == ProviderKind::Anthropic {
+        let msg = "Streaming wird für native Anthropic-Provider noch nicht unterstützt";
+        log_failure(&state.store, &tool, &session, task_key, input_tokens, "anthropic_stream", 400, msg);
+        return error_response(StatusCode::BAD_REQUEST, msg);
+    }
 
     // Per-Request-Kostendeckel
     if let Some(mc) = max_cost {
@@ -225,69 +241,89 @@ async fn forward_with_retries(
 
     for entry in plan.chain.iter() {
         let target = entry.target();
-        let mut attempt: u32 = 0;
-        loop {
-            attempts += 1;
-            match providers::forward(&state.cfg, &state.http, &target, body.clone()).await {
-                Ok(resp) if resp.status().is_success() => {
-                    trail.push(json!({ "provider": target.provider, "model": target.model, "status": resp.status().as_u16() }));
-                    return handle_success(
-                        state, resp, entry, &plan, task_key, tool, session,
-                        entry.provider != plan.chain[0].provider || entry.model != plan.chain[0].model,
-                        is_stream, input_tokens, attempts, trail, cache_key, started,
-                    )
-                    .await;
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    last_status = status;
-                    let detail = resp.text().await.unwrap_or_default();
-                    last_err = format!("{status}: {}", truncate(&detail, 300));
-                    trail.push(json!({ "provider": target.provider, "model": target.model, "status": status.as_u16(), "error": truncate(&detail, 200) }));
 
-                    match classify_status(status) {
-                        Outcome::Transient if attempt < state.cfg.retry.max_retries => {
+        // Einsatzbereite Keys für dieses Modell auflösen und gewichtet ordnen.
+        let resolved = match state.cfg.providers.get(&target.provider) {
+            Some(p) => providers::resolve_keys(p, &target.model),
+            None => Vec::new(),
+        };
+        if resolved.is_empty() {
+            last_err = format!("kein nutzbarer API-Key für Provider '{}'", target.provider);
+            trail.push(json!({ "provider": target.provider, "model": target.model, "error": last_err.clone() }));
+            continue; // nächstes Modell
+        }
+        let order = providers::order_keys_weighted(resolved, random_unit());
+
+        'keys: for (key_idx, key) in order.into_iter().enumerate() {
+            let mut attempt: u32 = 0;
+            loop {
+                attempts += 1;
+                match providers::forward(&state.cfg, &state.http, &target, body.clone(), key.auth.as_deref()).await {
+                    Ok(resp) if resp.status().is_success() => {
+                        trail.push(json!({ "provider": target.provider, "model": target.model, "key": key_idx, "status": resp.status().as_u16() }));
+                        return handle_success(
+                            state, resp, entry, &plan, task_key, tool, session,
+                            entry.provider != plan.chain[0].provider || entry.model != plan.chain[0].model,
+                            is_stream, input_tokens, attempts, trail, cache_key, started,
+                        )
+                        .await;
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        last_status = status;
+                        let detail = resp.text().await.unwrap_or_default();
+                        last_err = format!("{status}: {}", truncate(&detail, 300));
+                        trail.push(json!({ "provider": target.provider, "model": target.model, "key": key_idx, "status": status.as_u16(), "error": truncate(&detail, 200) }));
+
+                        match classify_status(status) {
+                            Outcome::Transient => {
+                                if attempt < state.cfg.retry.max_retries {
+                                    let ms = backoff_ms(&state.cfg.retry, attempt);
+                                    tracing::warn!(provider = %target.provider, model = %target.model, "transient {status}, retry #{} in {ms}ms", attempt + 1);
+                                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                                    attempt += 1;
+                                    continue;
+                                }
+                                break 'keys; // transiente Fehler erschöpft -> nächstes Modell
+                            }
+                            Outcome::KeyExhausted => {
+                                tracing::warn!(provider = %target.provider, model = %target.model, key = key_idx, "key-fehler {status}, rotiere Key");
+                                break; // nächster Key
+                            }
+                            Outcome::BadRequest => {
+                                // Request ist fehlerhaft -> kein Fallback, Status durchreichen.
+                                let _ = state.store.insert(&RequestLog {
+                                    tool: tool.into(),
+                                    session: session.clone(),
+                                    task_type: task_key.into(),
+                                    model: entry.model.clone(),
+                                    provider: entry.provider.clone(),
+                                    tier: plan.tier,
+                                    degraded: plan.degraded,
+                                    budget_pressure: plan.pressure,
+                                    estimated_tokens: input_tokens,
+                                    status: status.as_u16(),
+                                    attempts,
+                                    attempt_trail: serde_json::to_string(&trail).ok(),
+                                    error: Some(last_err.clone()),
+                                    ..Default::default()
+                                });
+                                return error_response(status, &last_err);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        trail.push(json!({ "provider": target.provider, "model": target.model, "key": key_idx, "error": last_err.clone() }));
+                        if attempt < state.cfg.retry.max_retries {
                             let ms = backoff_ms(&state.cfg.retry, attempt);
-                            tracing::warn!(provider = %target.provider, model = %target.model, "transient {status}, retry #{} in {ms}ms", attempt + 1);
+                            tracing::warn!(provider = %target.provider, model = %target.model, "netzwerkfehler, retry #{} in {ms}ms", attempt + 1);
                             tokio::time::sleep(Duration::from_millis(ms)).await;
                             attempt += 1;
                             continue;
                         }
-                        Outcome::BadRequest => {
-                            // Request ist fehlerhaft -> kein Fallback, Status durchreichen.
-                            // Echte Versuchszahl + Trail protokollieren (nicht attempts=0).
-                            let _ = state.store.insert(&RequestLog {
-                                tool: tool.into(),
-                                session: session.clone(),
-                                task_type: task_key.into(),
-                                model: entry.model.clone(),
-                                provider: entry.provider.clone(),
-                                tier: plan.tier,
-                                degraded: plan.degraded,
-                                budget_pressure: plan.pressure,
-                                estimated_tokens: input_tokens,
-                                status: status.as_u16(),
-                                attempts,
-                                attempt_trail: serde_json::to_string(&trail).ok(),
-                                error: Some(last_err.clone()),
-                                ..Default::default()
-                            });
-                            return error_response(status, &last_err);
-                        }
-                        _ => break, // Retries erschöpft oder Provider erschöpft -> nächstes Modell
+                        break 'keys; // Netzwerkfehler erschöpft -> nächstes Modell
                     }
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    trail.push(json!({ "provider": target.provider, "model": target.model, "error": last_err.clone() }));
-                    if attempt < state.cfg.retry.max_retries {
-                        let ms = backoff_ms(&state.cfg.retry, attempt);
-                        tracing::warn!(provider = %target.provider, model = %target.model, "netzwerkfehler, retry #{} in {ms}ms", attempt + 1);
-                        tokio::time::sleep(Duration::from_millis(ms)).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    break;
                 }
             }
         }
@@ -369,6 +405,17 @@ async fn handle_success(
                 &format!("Antwort des Providers nicht lesbar: {e}"),
             )
         }
+    };
+
+    // Native Anthropic-Antwort ins OpenAI-Format übersetzen, bevor Usage/Cache/Logging greifen.
+    let payload = if state.cfg.provider_kind(&entry.provider) == ProviderKind::Anthropic {
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        providers::to_openai_response(&payload, created)
+    } else {
+        payload
     };
 
     let prompt_tokens = payload
@@ -636,13 +683,22 @@ fn cache_hit_response(
 
 fn classify_status(status: StatusCode) -> Outcome {
     let c = status.as_u16();
-    if c == 408 || c == 429 || status.is_server_error() {
+    if c == 401 || c == 402 || c == 403 || c == 429 {
+        Outcome::KeyExhausted
+    } else if c == 408 || status.is_server_error() {
         Outcome::Transient
-    } else if c == 401 || c == 402 || c == 403 {
-        Outcome::ProviderExhausted
     } else {
         Outcome::BadRequest
     }
+}
+
+/// Pseudozufälliger Wert in [0,1) aus der Systemzeit — für die gewichtete Key-Wahl.
+fn random_unit() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1_000_000) as f64 / 1_000_000.0
 }
 
 /// Exponentielles Backoff mit ±20 % Jitter, gedeckelt auf backoff_max_ms.
@@ -819,10 +875,324 @@ mod tests {
     #[test]
     fn status_classification() {
         assert!(matches!(classify_status(StatusCode::INTERNAL_SERVER_ERROR), Outcome::Transient));
-        assert!(matches!(classify_status(StatusCode::TOO_MANY_REQUESTS), Outcome::Transient));
-        assert!(matches!(classify_status(StatusCode::UNAUTHORIZED), Outcome::ProviderExhausted));
-        assert!(matches!(classify_status(StatusCode::PAYMENT_REQUIRED), Outcome::ProviderExhausted));
+        assert!(matches!(classify_status(StatusCode::REQUEST_TIMEOUT), Outcome::Transient));
+        assert!(matches!(classify_status(StatusCode::TOO_MANY_REQUESTS), Outcome::KeyExhausted));
+        assert!(matches!(classify_status(StatusCode::UNAUTHORIZED), Outcome::KeyExhausted));
+        assert!(matches!(classify_status(StatusCode::PAYMENT_REQUIRED), Outcome::KeyExhausted));
         assert!(matches!(classify_status(StatusCode::BAD_REQUEST), Outcome::BadRequest));
+    }
+
+    /// Ein toter Key (401) führt zur Rotation auf den nächsten Key statt zum
+    /// Request-Fehler (T3.2). Der Mock antwortet beim ersten Aufruf mit 401, danach 200.
+    #[tokio::test]
+    async fn dead_key_rotates_instead_of_failing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = {
+            let calls = calls.clone();
+            Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            (StatusCode::UNAUTHORIZED, Json(json!({ "error": "dead key" }))).into_response()
+                        } else {
+                            Json(json!({
+                                "id": "x", "object": "chat.completion",
+                                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                                "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+                            }))
+                            .into_response()
+                        }
+                    }
+                }),
+            )
+        };
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+        std::env::set_var("LLMUX_TEST_KEY_A", "dead");
+        std::env::set_var("LLMUX_TEST_KEY_B", "good");
+        let yaml = format!(
+            r#"
+server: {{ host: "127.0.0.1", port: 0 }}
+retry: {{ max_retries: 0, backoff_initial_ms: 1, backoff_max_ms: 1 }}
+providers:
+  p:
+    enabled: true
+    base_url: "http://{mock_addr}"
+    keys:
+      - {{ env: "LLMUX_TEST_KEY_A", weight: 1.0 }}
+      - {{ env: "LLMUX_TEST_KEY_B", weight: 1.0 }}
+models:
+  - {{ provider: p, model: "m1", tier: 1, context: 8000, supports_tools: true, input_per_mtok: 0.0, output_per_mtok: 0.0 }}
+classification:
+  simple_text:       {{ min_tier: 1 }}
+  summarize:         {{ min_tier: 1 }}
+  code_review:       {{ min_tier: 1 }}
+  architecture:      {{ min_tier: 1 }}
+  private_sensitive: {{ min_tier: 1 }}
+"#
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let state = Arc::new(AppState {
+            cfg,
+            http: reqwest::Client::new(),
+            store: Store::open(":memory:").unwrap(),
+            sessions: SessionStore::default(),
+        });
+        let app = build_router(state.clone());
+        let llmux_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llmux_addr = llmux_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(llmux_listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{llmux_addr}/v1/chat/completions");
+        let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        let resp = client.post(&url).json(&body).send().await.unwrap();
+
+        assert_eq!(resp.status(), 200, "Rotation muss den toten Key überbrücken");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "erst 401, dann rotierter 200");
+
+        std::env::remove_var("LLMUX_TEST_KEY_A");
+        std::env::remove_var("LLMUX_TEST_KEY_B");
+    }
+
+    /// Nicht unterstützte Request-Felder werden vor dem Weiterleiten entfernt; der
+    /// Request gelangt trotzdem erfolgreich zum Provider (T3.4).
+    #[tokio::test]
+    async fn unsupported_params_are_stripped() {
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let mock = {
+            let seen = seen.clone();
+            Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().unwrap() = Some(body);
+                        Json(json!({
+                            "id": "x", "object": "chat.completion",
+                            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                            "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+                        }))
+                    }
+                }),
+            )
+        };
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+        // Provider strippt logit_bias, das Modell zusätzlich frequency_penalty.
+        let yaml = format!(
+            r#"
+server: {{ host: "127.0.0.1", port: 0 }}
+providers:
+  p: {{ enabled: true, base_url: "http://{mock_addr}", strip_params: ["logit_bias"] }}
+models:
+  - {{ provider: p, model: "m1", tier: 1, context: 8000, supports_tools: true, input_per_mtok: 0.0, output_per_mtok: 0.0, strip_params: ["frequency_penalty"] }}
+classification:
+  simple_text:       {{ min_tier: 1 }}
+  summarize:         {{ min_tier: 1 }}
+  code_review:       {{ min_tier: 1 }}
+  architecture:      {{ min_tier: 1 }}
+  private_sensitive: {{ min_tier: 1 }}
+"#
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let state = Arc::new(AppState {
+            cfg,
+            http: reqwest::Client::new(),
+            store: Store::open(":memory:").unwrap(),
+            sessions: SessionStore::default(),
+        });
+        let app = build_router(state.clone());
+        let llmux_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llmux_addr = llmux_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(llmux_listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{llmux_addr}/v1/chat/completions");
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "frequency_penalty": 0.5,
+            "logit_bias": { "50256": -100 },
+            "temperature": 0.2
+        });
+        let resp = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let received = seen.lock().unwrap().clone().expect("mock erhielt einen Request");
+        assert!(received.get("frequency_penalty").is_none(), "frequency_penalty muss entfernt sein");
+        assert!(received.get("logit_bias").is_none(), "logit_bias muss entfernt sein");
+        // Unbetroffene Felder bleiben erhalten.
+        assert_eq!(received["temperature"], 0.2);
+    }
+
+    /// Ein Alias im `model`-Feld erzwingt das konfigurierte Zielmodell statt der
+    /// (günstigeren) dynamischen Auswahl (T3.3).
+    #[tokio::test]
+    async fn model_alias_routes_to_configured_target() {
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let mock = {
+            let seen = seen.clone();
+            Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().unwrap() = Some(body);
+                        Json(json!({
+                            "id": "x", "object": "chat.completion",
+                            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                            "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+                        }))
+                    }
+                }),
+            )
+        };
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+        // basic ist günstiger und würde dynamisch gewählt; Alias zwingt zu premium.
+        let yaml = format!(
+            r#"
+server: {{ host: "127.0.0.1", port: 0 }}
+providers:
+  p: {{ enabled: true, base_url: "http://{mock_addr}" }}
+models:
+  - {{ provider: p, model: "basic",   tier: 1, context: 8000, supports_tools: true, input_per_mtok: 0.1, output_per_mtok: 0.1 }}
+  - {{ provider: p, model: "premium", tier: 1, context: 8000, supports_tools: true, input_per_mtok: 9.0, output_per_mtok: 9.0 }}
+aliases:
+  best: "premium"
+classification:
+  simple_text:       {{ min_tier: 1 }}
+  summarize:         {{ min_tier: 1 }}
+  code_review:       {{ min_tier: 1 }}
+  architecture:      {{ min_tier: 1 }}
+  private_sensitive: {{ min_tier: 1 }}
+"#
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let state = Arc::new(AppState {
+            cfg,
+            http: reqwest::Client::new(),
+            store: Store::open(":memory:").unwrap(),
+            sessions: SessionStore::default(),
+        });
+        let app = build_router(state.clone());
+        let llmux_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llmux_addr = llmux_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(llmux_listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{llmux_addr}/v1/chat/completions");
+        let body = json!({ "model": "best", "messages": [{ "role": "user", "content": "hi" }] });
+        let resp = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let received = seen.lock().unwrap().clone().expect("mock erhielt einen Request");
+        assert_eq!(received["model"], "premium", "Alias 'best' muss zu 'premium' routen");
+    }
+
+    /// End-to-End über einen Mock-Anthropic-Provider: der OpenAI-Request wird nach
+    /// `/messages` übersetzt (system extrahiert, max_tokens gesetzt) und die Antwort
+    /// zurück ins OpenAI-Format inkl. usage (T3.1).
+    #[tokio::test]
+    async fn anthropic_provider_translates_request_and_response() {
+        use std::sync::Mutex;
+
+        // Mock Anthropic: speichert den empfangenen Body, antwortet im Anthropic-Format.
+        let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let mock = {
+            let seen = seen.clone();
+            Router::new().route(
+                "/messages",
+                post(move |Json(body): Json<Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().unwrap() = Some(body);
+                        Json(json!({
+                            "id": "msg_abc",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "claude-mock",
+                            "stop_reason": "end_turn",
+                            "content": [{ "type": "text", "text": "Hallo!" }],
+                            "usage": { "input_tokens": 9, "output_tokens": 4 }
+                        }))
+                    }
+                }),
+            )
+        };
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+        std::env::set_var("LLMUX_TEST_ANTHROPIC_KEY", "sk-test");
+        let yaml = format!(
+            r#"
+server: {{ host: "127.0.0.1", port: 0 }}
+providers:
+  anthropic: {{ enabled: true, kind: anthropic, base_url: "http://{mock_addr}", api_key_env: "LLMUX_TEST_ANTHROPIC_KEY" }}
+models:
+  - {{ provider: anthropic, model: "claude-mock", tier: 1, context: 200000, supports_tools: true, input_per_mtok: 3.0, output_per_mtok: 15.0 }}
+classification:
+  simple_text:       {{ min_tier: 1 }}
+  summarize:         {{ min_tier: 1 }}
+  code_review:       {{ min_tier: 1 }}
+  architecture:      {{ min_tier: 1 }}
+  private_sensitive: {{ min_tier: 1 }}
+"#
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let state = Arc::new(AppState {
+            cfg,
+            http: reqwest::Client::new(),
+            store: Store::open(":memory:").unwrap(),
+            sessions: SessionStore::default(),
+        });
+        let app = build_router(state.clone());
+        let llmux_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llmux_addr = llmux_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(llmux_listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{llmux_addr}/v1/chat/completions");
+        let body = json!({
+            "messages": [
+                { "role": "system", "content": "Du bist hilfreich." },
+                { "role": "user", "content": "Hallo" }
+            ]
+        });
+        let resp = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let out: Value = resp.json().await.unwrap();
+
+        // Antwort ist OpenAI-geformt inkl. usage.
+        assert_eq!(out["object"], "chat.completion");
+        assert_eq!(out["choices"][0]["message"]["content"], "Hallo!");
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+        assert_eq!(out["usage"]["prompt_tokens"], 9);
+        assert_eq!(out["usage"]["completion_tokens"], 4);
+
+        // Request wurde nach Anthropic übersetzt: system extrahiert, max_tokens gesetzt.
+        let received = seen.lock().unwrap().clone().expect("mock erhielt einen Request");
+        assert_eq!(received["system"], "Du bist hilfreich.");
+        assert!(received["max_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(received["messages"][0]["role"], "user");
+
+        std::env::remove_var("LLMUX_TEST_ANTHROPIC_KEY");
     }
 
     /// End-to-End über einen Mock-Provider: Streaming reicht SSE durch, loggt reale

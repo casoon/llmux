@@ -65,6 +65,7 @@ mod tests {
             supports_tools: false,
             input_per_mtok: 0.0,
             output_per_mtok: 0.0,
+            strip_params: Vec::new(),
         }
     }
 

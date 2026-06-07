@@ -50,6 +50,11 @@ providers:
     enabled: true
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
+    # Alternativ mehrere Keys mit Gewicht + optionalem Modellfilter (statt api_key_env).
+    # Gewichtet-zufällige Auswahl; bei 401/402/403/429 Rotation zum nächsten Key.
+    # keys:
+    #   - { env: "OPENROUTER_KEY_A", weight: 3.0 }
+    #   - { env: "OPENROUTER_KEY_B", weight: 1.0, allow: ["anthropic/claude-3-opus"] }
   openai:
     enabled: true
     base_url: "https://api.openai.com/v1"
@@ -59,6 +64,15 @@ providers:
     base_url: "http://localhost:11434/v1"
     api_key_env: null
     local: true
+    # Vom Provider nicht unterstützte Felder werden vor dem Senden entfernt.
+    strip_params: ["frequency_penalty", "presence_penalty", "logit_bias"]
+  # Nativer Anthropic-Provider (kind: anthropic) — spricht /v1/messages direkt,
+  # statt über einen OpenAI-kompatiblen Zwischenschritt. Auth via x-api-key.
+  anthropic:
+    enabled: false
+    kind: anthropic
+    base_url: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
 
 # Modell-Katalog: der Selektor wählt daraus dynamisch das günstigste Modell,
 # das Tier-Floor, Tool-Bedarf, Kontextgröße, Privacy und Budget erfüllt.
@@ -75,6 +89,13 @@ models:
 
 # task_type -> Anforderung. min_tier = Qualitäts-Floor; require_tools/local_only =
 # harte Bedingungen; expected_output_ratio steuert Kostenschätzung & Ranking.
+# Logische Modell-Aliase: greifen auf x-llmux-model und das model-Feld des Requests.
+# Ein passender Alias erzwingt das Zielmodell (sonst dynamische Auswahl).
+aliases:
+  fast: "google/gemini-flash-1.5"
+  best: "anthropic/claude-3-opus"
+  cheap: "meta-llama/llama-3.1-8b-instruct:free"
+
 classification:
   simple_text:       { min_tier: 1, expected_output_ratio: 0.5 }
   summarize:         { min_tier: 1, expected_output_ratio: 0.3 }
