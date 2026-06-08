@@ -1,11 +1,10 @@
 ---
 import {
   Activity,
-  AlertTriangle,
   Boxes,
   BrainCircuit,
-  CheckCircle2,
   ChevronRight,
+  CircleCheck,
   CircleDollarSign,
   Clock3,
   DatabaseZap,
@@ -14,16 +13,15 @@ import {
   LockKeyhole,
   Network,
   Radar,
+  RefreshCw,
   Route,
   Search,
   Settings2,
   ShieldCheck,
-  SlidersHorizontal,
-  TerminalSquare,
-  Zap,
+  SquareTerminal,
+  TriangleAlert,
 } from '@lucide/astro';
 import '../styles/app.css';
-import { budgetSeries, modelMatrix, overview, policySignals, projectRows, routeFeed } from '../data/dashboard';
 
 const nav = [
   { label: 'Overview', icon: LayoutDashboard, active: true },
@@ -32,27 +30,9 @@ const nav = [
   { label: 'Models', icon: Boxes },
   { label: 'Projects', icon: Network },
   { label: 'Costs', icon: CircleDollarSign },
-  { label: 'Diagnostics', icon: TerminalSquare },
+  { label: 'Diagnostics', icon: SquareTerminal },
   { label: 'Settings', icon: Settings2 },
 ];
-
-const statusClasses = {
-  allowed: 'text-success bg-success/8',
-  degraded: 'text-warning bg-warning/8',
-  cached: 'text-accent bg-accent/8',
-  fallback: 'text-info bg-info/8',
-  rejected: 'text-error bg-error/8',
-  forced: 'text-muted bg-surface-2',
-};
-
-const toneClasses = {
-  success: 'text-success',
-  warning: 'text-warning',
-  error: 'text-error',
-  info: 'text-info',
-};
-
-const maxBudget = Math.max(...budgetSeries);
 ---
 
 <!doctype html>
@@ -61,10 +41,12 @@ const maxBudget = Math.max(...budgetSeries);
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="llmux local LLM routing control room" />
+    <!-- Override the Stats API base for local dev: same-origin by default (embedded build). -->
+    <meta name="llmux-api-base" content="" />
     <title>llmux Control Room</title>
   </head>
   <body>
-    <div class="min-h-screen lg:grid lg:grid-cols-[72px_minmax(0,1fr)]">
+    <div x-data="dashboard()" x-cloak class="min-h-screen lg:grid lg:grid-cols-[72px_minmax(0,1fr)]">
       <aside class="hidden border-e border-border/70 bg-bg/78 backdrop-blur-xl lg:flex lg:min-h-screen lg:flex-col lg:items-center lg:py-4">
         <a class="focus-ring mb-6 flex size-11 items-center justify-center rounded-lg border border-accent/35 bg-accent/10 text-accent" href="/" aria-label="llmux overview">
           <Route size={22} stroke-width={2.2} />
@@ -81,6 +63,7 @@ const maxBudget = Math.max(...budgetSeries);
                     : 'border-transparent text-muted hover:border-border hover:bg-surface hover:text-text',
                 ]}
                 href="#"
+                aria-current={item.active ? 'page' : undefined}
                 aria-label={item.label}
               >
                 <Icon size={20} />
@@ -103,54 +86,92 @@ const maxBudget = Math.max(...budgetSeries);
               <div>
                 <div class="flex items-center gap-2">
                   <h1 class="text-xl font-semibold tracking-normal text-text">llmux Control Room</h1>
-                  <span class="chip border-success/35 bg-success/8 text-success">
-                    <span class="size-1.5 rounded-full bg-success"></span>
-                    {overview.status}
+                  <span
+                    class="chip"
+                    :class="online ? 'border-success/35 bg-success/8 text-success' : (stale ? 'border-warning/35 bg-warning/8 text-warning' : (state==='loading' ? 'border-border bg-surface text-muted' : 'border-error/35 bg-error/8 text-error'))"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <span class="size-1.5 rounded-full" :class="online ? 'bg-success' : (stale ? 'bg-warning' : (state==='loading' ? 'bg-muted' : 'bg-error'))"></span>
+                    <span x-text="state==='loading' ? 'Connecting…' : (online ? (overview?.status ?? 'online') : (stale ? 'Stale data' : 'Offline'))"></span>
                   </span>
                 </div>
-                <p class="mt-1 text-sm text-muted">Local policy, routing, cost and model telemetry.</p>
+                <p class="mt-1 text-sm text-muted">
+                  Local policy, routing, cost and model telemetry.
+                  <span class="text-faint" x-show="lastUpdated" x-text="lastUpdated ? ('· updated ' + fmtTime(lastUpdated.toISOString())) : ''"></span>
+                </p>
               </div>
             </div>
 
             <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <label class="focus-within:border-accent/45 flex h-10 min-w-0 items-center gap-2 rounded-lg border border-border bg-surface px-3 text-muted transition sm:w-80">
+              <label class="focus-within:border-accent/45 flex h-10 min-w-0 items-center gap-2 rounded-lg border border-border bg-surface px-3 text-muted transition sm:w-72">
                 <Search size={17} />
-                <input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-text outline-none placeholder:text-faint" placeholder="Search requests, models, projects" />
+                <input
+                  class="min-w-0 flex-1 border-0 bg-transparent text-sm text-text outline-none placeholder:text-faint"
+                  placeholder="Search tool, model, project…"
+                  x-model="search"
+                  aria-label="Search requests"
+                />
               </label>
-              <button class="focus-ring inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-border bg-surface px-3 text-sm text-text transition hover:border-accent/35 hover:bg-surface-2">
-                <SlidersHorizontal size={17} />
-                Filters
+              <select x-model="resultFilter" aria-label="Filter by policy result" class="focus-ring h-10 rounded-lg border border-border bg-surface px-2 text-sm text-text">
+                <template x-for="r in resultFilters" :key="r">
+                  <option :value="r" x-text="r === 'all' ? 'All results' : r"></option>
+                </template>
+              </select>
+              <select x-model="window" aria-label="Time window" class="focus-ring h-10 rounded-lg border border-border bg-surface px-2 text-sm text-text">
+                <option value="1h">Last hour</option>
+                <option value="24h">Last 24h</option>
+                <option value="all">All time</option>
+              </select>
+              <button @click="load()" class="focus-ring inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-border bg-surface px-3 text-sm text-text transition hover:border-accent/35 hover:bg-surface-2" aria-label="Refresh now">
+                <RefreshCw size={16} />
+                <span class="hidden sm:inline">Refresh</span>
               </button>
             </div>
           </div>
         </header>
 
         <div class="px-4 py-4 sm:px-6 lg:px-8">
+          <!-- Error state (first load failed entirely) -->
+          <div x-show="state==='error'" class="panel rounded-lg p-8 text-center">
+            <div class="mx-auto mb-3 flex size-12 items-center justify-center rounded-full border border-error/35 bg-error/8 text-error">
+              <TriangleAlert size={22} />
+            </div>
+            <h2 class="text-base font-semibold">Stats API unreachable</h2>
+            <p class="mx-auto mt-1 max-w-md text-sm text-muted" x-text="error || 'Could not reach the llmux Stats API.'"></p>
+            <p class="mx-auto mt-1 max-w-md text-xs text-faint">During local dev, point the dashboard at a running instance with <span class="font-mono">?api=http://127.0.0.1:8080</span>.</p>
+            <button @click="load()" class="focus-ring mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-accent px-4 text-sm font-medium text-bg transition hover:bg-accent/88">
+              <RefreshCw size={16} />
+              Retry
+            </button>
+          </div>
+
+          <div x-show="state!=='error'" :class="stale ? 'opacity-90' : ''">
           <section class="grid gap-3 sm:grid-cols-2 xl:grid-cols-5" aria-label="Overview metrics">
             <article class="panel rounded-lg p-4">
               <div class="flex items-center justify-between text-sm text-muted">
                 <span>Requests/min</span>
                 <Activity size={17} class="text-accent" />
               </div>
-              <div class="metric-value mt-3 text-3xl font-semibold">{overview.requestsPerMinute}</div>
-              <p class="mt-1 text-xs text-muted">+14% from last hour</p>
+              <div class="metric-value mt-3 text-3xl font-semibold" :class="state==='loading' && !overview ? 'animate-pulse text-muted' : ''" x-text="overview ? overview.requests_per_minute.toFixed(1) : '—'"></div>
+              <p class="mt-1 text-xs text-muted" x-text="overview ? (overview.total_requests + ' total requests') : 'loading…'"></p>
             </article>
             <article class="panel rounded-lg p-4">
               <div class="flex items-center justify-between text-sm text-muted">
                 <span>Today cost</span>
                 <CircleDollarSign size={17} class="text-success" />
               </div>
-              <div class="metric-value mt-3 text-3xl font-semibold">${overview.todayCost.toFixed(2)}</div>
-              <p class="mt-1 text-xs text-muted">daily cap $2.00</p>
+              <div class="metric-value mt-3 text-3xl font-semibold" x-text="overview ? fmtCost(overview.cost_today) : '—'"></div>
+              <p class="mt-1 text-xs text-muted" x-text="overview?.daily_max_usd ? ('daily cap $' + overview.daily_max_usd.toFixed(2)) : 'no daily cap'"></p>
             </article>
             <article class="panel rounded-lg p-4">
               <div class="flex items-center justify-between text-sm text-muted">
                 <span>Budget used</span>
                 <Gauge size={17} class="text-warning" />
               </div>
-              <div class="metric-value mt-3 text-3xl font-semibold">{overview.budgetUsed}%</div>
+              <div class="metric-value mt-3 text-3xl font-semibold" x-text="overview ? (budgetUsedPct + '%') : '—'"></div>
               <div class="mt-3 h-1.5 rounded-full bg-bg-raised">
-                <div class="h-full rounded-full bg-warning" style={`width: ${overview.budgetUsed}%`}></div>
+                <div class="h-full rounded-full" :class="budgetUsedPct >= 90 ? 'bg-error' : (budgetUsedPct >= 70 ? 'bg-warning' : 'bg-success')" :style="'width:' + Math.min(100, budgetUsedPct) + '%'"></div>
               </div>
             </article>
             <article class="panel rounded-lg p-4">
@@ -158,16 +179,16 @@ const maxBudget = Math.max(...budgetSeries);
                 <span>Cache hit rate</span>
                 <DatabaseZap size={17} class="text-accent" />
               </div>
-              <div class="metric-value mt-3 text-3xl font-semibold">{overview.cacheHitRate}%</div>
-              <p class="mt-1 text-xs text-muted">exact match cache</p>
+              <div class="metric-value mt-3 text-3xl font-semibold" x-text="overview ? fmtPct(overview.cache_hit_rate) : '—'"></div>
+              <p class="mt-1 text-xs text-muted">exact + semantic cache</p>
             </article>
             <article class="panel rounded-lg p-4 sm:col-span-2 xl:col-span-1">
               <div class="flex items-center justify-between text-sm text-muted">
                 <span>p95 latency</span>
                 <Clock3 size={17} class="text-info" />
               </div>
-              <div class="metric-value mt-3 text-3xl font-semibold">{(overview.p95Latency / 1000).toFixed(2)}s</div>
-              <p class="mt-1 text-xs text-muted">provider responses</p>
+              <div class="metric-value mt-3 text-3xl font-semibold" x-text="overview ? fmtLatency(overview.p95_latency_ms) : '—'"></div>
+              <p class="mt-1 text-xs text-muted" x-text="overview ? (overview.error_count + ' errors') : 'provider responses'"></p>
             </article>
           </section>
 
@@ -176,58 +197,72 @@ const maxBudget = Math.max(...budgetSeries);
               <div class="flex flex-col gap-3 border-b border-border/70 p-4 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <h2 class="text-base font-semibold">Live route feed</h2>
-                  <p class="mt-1 text-sm text-muted">Recent routing decisions with policy and provider outcomes.</p>
+                  <p class="mt-1 text-sm text-muted">
+                    Recent routing decisions
+                    <span x-show="state==='ready'" x-text="'· ' + filteredRequests.length + ' shown'"></span>
+                  </p>
                 </div>
-                <button class="focus-ring inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-accent px-3 text-sm font-medium text-bg transition hover:bg-accent/88">
-                  <Zap size={16} />
-                  Inspect live
-                </button>
               </div>
 
-              <div class="scrollbar-subtle overflow-x-auto">
+              <div class="scrollbar-subtle overflow-x-auto" tabindex="0" role="region" aria-label="Route feed (scrollable)">
                 <table class="w-full min-w-[920px] border-collapse text-sm">
                   <thead class="bg-bg-raised/70 text-xs uppercase text-faint">
                     <tr>
-                      <th class="px-4 py-3 text-start font-medium">Time</th>
-                      <th class="px-4 py-3 text-start font-medium">Tool / Project</th>
-                      <th class="px-4 py-3 text-start font-medium">Task</th>
-                      <th class="px-4 py-3 text-start font-medium">Selected model</th>
-                      <th class="px-4 py-3 text-start font-medium">Cost</th>
-                      <th class="px-4 py-3 text-start font-medium">Latency</th>
-                      <th class="px-4 py-3 text-start font-medium">Policy</th>
-                      <th class="px-4 py-3 text-end font-medium">Open</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Time</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Tool / Project</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Task</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Selected model</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Cost</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Latency</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Policy</th>
+                      <th class="px-4 py-3 text-end font-medium" scope="col">Open</th>
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-border/60">
-                    {routeFeed.map((row, index) => (
-                      <tr class="group transition hover:bg-surface-2/70" data-request-row data-request={JSON.stringify(row)}>
-                        <td class="metric-value px-4 py-3 text-muted">{row.time}</td>
+                    <template x-if="state==='loading' && requests.length===0">
+                      <tr><td colspan="8" class="px-4 py-10 text-center text-muted">Loading route feed…</td></tr>
+                    </template>
+                    <template x-if="feedEmpty">
+                      <tr><td colspan="8" class="px-4 py-10 text-center text-muted">No requests match the current filters.</td></tr>
+                    </template>
+                    <template x-for="row in filteredRequests" :key="row.id">
+                      <tr
+                        class="group cursor-pointer transition hover:bg-surface-2/70 focus-within:bg-surface-2/70"
+                        tabindex="0"
+                        role="button"
+                        :aria-label="'Inspect request ' + row.id"
+                        @click="openInspector(row)"
+                        @keydown.enter="openInspector(row)"
+                        @keydown.space.prevent="openInspector(row)"
+                      >
+                        <td class="metric-value px-4 py-3 text-muted" x-text="fmtTime(row.time)"></td>
                         <td class="px-4 py-3">
-                          <div class="font-medium text-text">{row.tool}</div>
-                          <div class="text-xs text-muted">{row.project}</div>
+                          <div class="font-medium text-text" x-text="row.tool ?? 'unknown'"></div>
+                          <div class="text-xs text-muted" x-text="row.project ?? '—'"></div>
                         </td>
                         <td class="px-4 py-3">
-                          <span class="rounded-md border border-border bg-bg-raised px-2 py-1 font-mono text-xs text-muted">{row.task}</span>
+                          <span class="rounded-md border border-border bg-bg-raised px-2 py-1 font-mono text-xs text-muted" x-text="row.task_type ?? '—'"></span>
                         </td>
                         <td class="px-4 py-3">
-                          <div class="font-medium text-text">{row.model}</div>
-                          <div class="text-xs text-muted">tier {row.tier || '-'}</div>
+                          <div class="font-medium text-text" x-text="row.model ?? '—'"></div>
+                          <div class="text-xs text-muted" x-text="row.tier ? ('tier ' + row.tier) : '—'"></div>
                         </td>
-                        <td class="metric-value px-4 py-3">{row.cost}</td>
-                        <td class="metric-value px-4 py-3 text-muted">{row.latency}</td>
+                        <td class="metric-value px-4 py-3" x-text="fmtCost(row.real_cost_usd)"></td>
+                        <td class="metric-value px-4 py-3 text-muted" x-text="fmtLatency(row.latency_ms)"></td>
                         <td class="px-4 py-3">
                           <div class="flex flex-wrap gap-1.5">
-                            <span class:list={['chip capitalize', statusClasses[row.status]]}>{row.status}</span>
-                            {row.chips.map((chip) => <span class="chip border-border bg-bg-raised text-muted">{chip}</span>)}
+                            <span class="chip capitalize" :class="resultClass(row.result)" x-text="row.result"></span>
+                            <span class="chip border-border bg-bg-raised text-muted" x-show="row.used_fallback">fallback</span>
+                            <span class="chip border-border bg-bg-raised text-muted" x-show="row.forced">forced</span>
                           </div>
                         </td>
                         <td class="px-4 py-3 text-end">
-                          <button class="focus-ring inline-flex size-8 items-center justify-center rounded-lg border border-border bg-surface text-muted transition hover:border-accent/35 hover:text-accent" data-open-inspector aria-label={`Inspect request ${index + 1}`}>
+                          <span class="inline-flex size-8 items-center justify-center rounded-lg border border-border bg-surface text-muted transition group-hover:border-accent/35 group-hover:text-accent" aria-hidden="true">
                             <ChevronRight size={16} />
-                          </button>
+                          </span>
                         </td>
                       </tr>
-                    ))}
+                    </template>
                   </tbody>
                 </table>
               </div>
@@ -238,23 +273,21 @@ const maxBudget = Math.max(...budgetSeries);
                 <div class="mb-4 flex items-center justify-between">
                   <div>
                     <h2 class="text-base font-semibold">Policy radar</h2>
-                    <p class="mt-1 text-sm text-muted">Decision outcomes today.</p>
+                    <p class="mt-1 text-sm text-muted">Decision outcomes.</p>
                   </div>
                   <Radar size={20} class="text-accent" />
                 </div>
+                <p class="text-sm text-muted" x-show="state==='ready' && policySignals.length===0">No policy data yet.</p>
                 <div class="grid gap-2">
-                  {policySignals.map((signal) => (
+                  <template x-for="signal in policySignals" :key="signal.label">
                     <div class="flex items-center justify-between rounded-lg border border-border/60 bg-bg-raised px-3 py-2">
                       <div class="flex items-center gap-2">
-                        <span class:list={['size-2 rounded-full', toneClasses[signal.tone]]} style="background: currentColor"></span>
-                        <span class="text-sm text-muted">{signal.label}</span>
+                        <span class="size-2 rounded-full" :class="signal.tone" style="background: currentColor"></span>
+                        <span class="text-sm text-muted" x-text="signal.label"></span>
                       </div>
-                      <div class="flex items-baseline gap-2">
-                        <span class="metric-value text-lg font-semibold">{signal.value}</span>
-                        <span class:list={['text-xs', toneClasses[signal.tone]]}>{signal.trend}</span>
-                      </div>
+                      <span class="metric-value text-lg font-semibold" x-text="signal.value"></span>
                     </div>
-                  ))}
+                  </template>
                 </div>
               </section>
 
@@ -262,20 +295,17 @@ const maxBudget = Math.max(...budgetSeries);
                 <div class="mb-4 flex items-center justify-between">
                   <div>
                     <h2 class="text-base font-semibold">Budget pressure</h2>
-                    <p class="mt-1 text-sm text-muted">Last 12 intervals.</p>
+                    <p class="mt-1 text-sm text-muted">Hourly cost · last 24h.</p>
                   </div>
-                  <AlertTriangle size={20} class="text-warning" />
+                  <TriangleAlert size={20} class="text-warning" />
                 </div>
-                <div class="flex h-36 items-end gap-2 rounded-lg border border-border/60 bg-bg-raised p-3">
-                  {budgetSeries.map((value) => (
-                    <div class="flex flex-1 items-end">
-                      <div
-                        class="w-full rounded-t bg-accent/80"
-                        style={`height: ${(value / maxBudget) * 100}%`}
-                        title={`${value}%`}
-                      ></div>
+                <p class="text-sm text-muted" x-show="state==='ready' && (budget?.buckets?.length ?? 0)===0">No cost recorded yet.</p>
+                <div class="flex h-36 items-end gap-1 rounded-lg border border-border/60 bg-bg-raised p-3" x-show="(budget?.buckets?.length ?? 0) > 0">
+                  <template x-for="(b, i) in (budget?.buckets ?? [])" :key="i">
+                    <div class="flex flex-1 items-end" :title="b.hour + ' · ' + fmtCost(b.cost) + ' · ' + b.requests + ' req'">
+                      <div class="w-full rounded-t" :class="b.cost > 0 ? 'bg-accent/80' : 'bg-surface-2'" :style="'height:' + Math.max(2, (b.cost / budgetMax) * 100) + '%'"></div>
                     </div>
-                  ))}
+                  </template>
                 </div>
               </section>
             </aside>
@@ -286,44 +316,43 @@ const maxBudget = Math.max(...budgetSeries);
               <div class="flex items-center justify-between border-b border-border/70 p-4">
                 <div>
                   <h2 class="text-base font-semibold">Model matrix</h2>
-                  <p class="mt-1 text-sm text-muted">Capability, reliability, cost and latency in one scan.</p>
+                  <p class="mt-1 text-sm text-muted">Observed reliability, cost and routing per model.</p>
                 </div>
                 <BrainCircuit size={20} class="text-accent" />
               </div>
-              <div class="scrollbar-subtle overflow-x-auto">
+              <div class="scrollbar-subtle overflow-x-auto" tabindex="0" role="region" aria-label="Model matrix (scrollable)">
                 <table class="w-full min-w-[820px] text-sm">
                   <thead class="bg-bg-raised/70 text-xs uppercase text-faint">
                     <tr>
-                      <th class="px-4 py-3 text-start font-medium">Model</th>
-                      <th class="px-4 py-3 text-start font-medium">Tier</th>
-                      <th class="px-4 py-3 text-start font-medium">Cost</th>
-                      <th class="px-4 py-3 text-start font-medium">p50</th>
-                      <th class="px-4 py-3 text-start font-medium">p95</th>
-                      <th class="px-4 py-3 text-start font-medium">Success</th>
-                      <th class="px-4 py-3 text-start font-medium">Capabilities</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Model</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Requests</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Avg tier</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Cost</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Success</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Cache</th>
+                      <th class="px-4 py-3 text-start font-medium" scope="col">Fallback</th>
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-border/60">
-                    {modelMatrix.map((model) => (
+                    <template x-if="state==='ready' && models.length===0">
+                      <tr><td colspan="7" class="px-4 py-10 text-center text-muted">No model activity yet.</td></tr>
+                    </template>
+                    <template x-for="m in models" :key="m.provider + '/' + m.model">
                       <tr class="hover:bg-surface-2/70">
                         <td class="px-4 py-3">
-                          <div class="font-medium text-text">{model.model}</div>
-                          <div class="text-xs text-muted">{model.provider}</div>
+                          <div class="font-medium text-text" x-text="m.model"></div>
+                          <div class="text-xs text-muted" x-text="m.provider"></div>
                         </td>
-                        <td class="metric-value px-4 py-3">{model.tier}</td>
-                        <td class="metric-value px-4 py-3">{model.cost}</td>
-                        <td class="metric-value px-4 py-3 text-muted">{model.p50}</td>
-                        <td class="metric-value px-4 py-3 text-muted">{model.p95}</td>
+                        <td class="metric-value px-4 py-3" x-text="m.requests"></td>
+                        <td class="metric-value px-4 py-3 text-muted" x-text="m.avg_tier.toFixed(1)"></td>
+                        <td class="metric-value px-4 py-3" x-text="fmtCost(m.real_cost_usd)"></td>
                         <td class="px-4 py-3">
-                          <span class="chip border-success/35 bg-success/8 text-success">{model.success}</span>
+                          <span class="chip" :class="m.success_rate >= 0.9 ? 'border-success/35 bg-success/8 text-success' : 'border-warning/35 bg-warning/8 text-warning'" x-text="fmtPct(m.success_rate)"></span>
                         </td>
-                        <td class="px-4 py-3">
-                          <div class="flex flex-wrap gap-1.5">
-                            {model.caps.map((cap) => <span class="chip border-border bg-bg-raised text-muted">{cap}</span>)}
-                          </div>
-                        </td>
+                        <td class="metric-value px-4 py-3 text-muted" x-text="fmtPct(m.cache_hit_rate)"></td>
+                        <td class="metric-value px-4 py-3 text-muted" x-text="fmtPct(m.fallback_rate)"></td>
                       </tr>
-                    ))}
+                    </template>
                   </tbody>
                 </table>
               </div>
@@ -337,136 +366,156 @@ const maxBudget = Math.max(...budgetSeries);
                 </div>
                 <LockKeyhole size={20} class="text-accent" />
               </div>
+              <p class="text-sm text-muted" x-show="state==='ready' && projects.length===0">No project-scoped traffic yet.</p>
               <div class="grid gap-2">
-                {projectRows.map((project) => (
+                <template x-for="project in projects" :key="project.project">
                   <article class="rounded-lg border border-border/60 bg-bg-raised p-3">
                     <div class="flex items-center justify-between">
-                      <h3 class="text-sm font-semibold">{project.name}</h3>
-                      <span class="metric-value text-sm text-muted">{project.spend}</span>
+                      <h3 class="text-sm font-semibold" x-text="project.project"></h3>
+                      <span class="metric-value text-sm text-muted" x-text="fmtCost(project.real_cost_usd)"></span>
                     </div>
                     <div class="mt-3 grid grid-cols-3 gap-2 text-xs">
                       <div>
                         <div class="text-faint">Requests</div>
-                        <div class="metric-value mt-1 text-sm text-text">{project.requests}</div>
+                        <div class="metric-value mt-1 text-sm text-text" x-text="project.requests"></div>
                       </div>
                       <div>
                         <div class="text-faint">Local</div>
-                        <div class="metric-value mt-1 text-sm text-success">{project.local}</div>
+                        <div class="metric-value mt-1 text-sm text-success" x-text="localPct(project)"></div>
                       </div>
                       <div>
                         <div class="text-faint">Rejects</div>
-                        <div class="metric-value mt-1 text-sm text-warning">{project.rejects}</div>
+                        <div class="metric-value mt-1 text-sm text-warning" x-text="project.rejected"></div>
                       </div>
                     </div>
                   </article>
-                ))}
+                </template>
               </div>
             </div>
           </section>
+          </div>
         </div>
       </main>
+
+      <!-- Request inspector -->
+      <div
+        x-show="inspectorOpen"
+        x-transition.opacity
+        class="fixed inset-0 z-30 bg-bg/45"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="drawer-title"
+        style="display: none"
+      >
+        <button class="absolute inset-0 cursor-default" aria-label="Close request inspector" @click="closeInspector()"></button>
+        <aside
+          class="absolute end-0 top-0 flex h-full w-full max-w-[460px] flex-col border-s border-border bg-bg-raised shadow-2xl"
+          x-transition:enter="transition duration-200" x-transition:enter-start="translate-x-6 opacity-0" x-transition:enter-end="translate-x-0 opacity-100"
+        >
+          <div class="border-b border-border p-4">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <p class="text-xs uppercase text-faint">Request inspector</p>
+                <h2 id="drawer-title" class="mt-1 text-lg font-semibold" x-text="selected ? ((selected.task_type ?? 'request') + ' · ' + selected.result) : 'Route decision'"></h2>
+              </div>
+              <button class="focus-ring inline-flex size-9 items-center justify-center rounded-lg border border-border bg-surface text-muted hover:text-text" aria-label="Close request inspector" @click="closeInspector()">×</button>
+            </div>
+          </div>
+          <div class="scrollbar-subtle flex-1 overflow-y-auto p-4" x-show="selected">
+            <div class="grid gap-3">
+              <div class="rounded-lg border border-border bg-surface p-3">
+                <div class="text-xs uppercase text-faint">Selected model</div>
+                <div class="mt-2 text-base font-semibold" x-text="selected ? ((selected.model ?? '—') + (selected.provider ? ' · ' + selected.provider : '')) : ''"></div>
+                <div class="mt-2 flex flex-wrap gap-1.5">
+                  <span class="chip" :class="resultClass(selected?.result)" x-text="selected?.result"></span>
+                  <span class="chip border-border bg-bg-raised text-muted" x-show="selected?.cache_hit">cache hit</span>
+                  <span class="chip border-border bg-bg-raised text-muted" x-show="selected?.used_fallback">fallback</span>
+                  <span class="chip border-border bg-bg-raised text-muted" x-show="selected?.degraded">degraded</span>
+                  <span class="chip border-border bg-bg-raised text-muted" x-show="selected?.forced">forced</span>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-3 gap-2">
+                <div class="rounded-lg border border-border bg-surface p-3">
+                  <div class="text-xs text-faint">Cost</div>
+                  <div class="metric-value mt-2" x-text="fmtCost(selected?.real_cost_usd)"></div>
+                </div>
+                <div class="rounded-lg border border-border bg-surface p-3">
+                  <div class="text-xs text-faint">Latency</div>
+                  <div class="metric-value mt-2" x-text="fmtLatency(selected?.latency_ms)"></div>
+                </div>
+                <div class="rounded-lg border border-border bg-surface p-3">
+                  <div class="text-xs text-faint">Tier</div>
+                  <div class="metric-value mt-2" x-text="selected?.tier || '—'"></div>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-3 gap-2">
+                <div class="rounded-lg border border-border bg-surface p-3">
+                  <div class="text-xs text-faint">Prompt tok</div>
+                  <div class="metric-value mt-2" x-text="selected?.prompt_tokens ?? 0"></div>
+                </div>
+                <div class="rounded-lg border border-border bg-surface p-3">
+                  <div class="text-xs text-faint">Output tok</div>
+                  <div class="metric-value mt-2" x-text="selected?.completion_tokens ?? 0"></div>
+                </div>
+                <div class="rounded-lg border border-border bg-surface p-3">
+                  <div class="text-xs text-faint">Attempts</div>
+                  <div class="metric-value mt-2" x-text="selected?.attempts ?? 0"></div>
+                </div>
+              </div>
+
+              <div class="rounded-lg border border-border bg-surface p-3">
+                <div class="text-xs uppercase text-faint">Classification</div>
+                <div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
+                  <span class="rounded-md border border-border bg-bg-raised px-2 py-1 font-mono text-xs text-muted" x-text="selected?.task_type ?? '—'"></span>
+                  <span class="text-muted" x-text="'tier ' + (selected?.tier || '—')"></span>
+                  <span class="text-muted" x-text="'· ' + (selected?.tool ?? 'unknown') + (selected?.session ? ' · ' + selected.session : '')"></span>
+                </div>
+              </div>
+
+              <div class="rounded-lg border border-border bg-surface p-3">
+                <div class="mb-3 flex items-center gap-2 text-sm font-medium">
+                  <CircleCheck size={16} class="text-success" />
+                  Provider attempts
+                </div>
+                <p class="text-xs text-muted" x-show="attemptChain.length===0">No provider attempt trail recorded.</p>
+                <ol class="grid gap-2 text-sm">
+                  <template x-for="(step, i) in attemptChain" :key="i">
+                    <li class="flex items-center justify-between rounded-md bg-bg-raised p-2">
+                      <span class="text-text" x-text="(step.provider ?? '?') + ' / ' + (step.model ?? '?')"></span>
+                      <span
+                        class="chip"
+                        :class="step.error ? 'border-error/35 bg-error/8 text-error' : 'border-success/35 bg-success/8 text-success'"
+                        x-text="step.error ? 'error' : ('HTTP ' + (step.status ?? '—'))"
+                      ></span>
+                    </li>
+                  </template>
+                </ol>
+              </div>
+
+              <div class="rounded-lg border border-border bg-surface p-3" x-show="selected?.stop_reason || selected?.error">
+                <div class="text-xs uppercase text-faint">Outcome</div>
+                <div class="mt-2 text-sm text-muted" x-show="selected?.stop_reason" x-text="'stop reason: ' + (selected?.stop_reason ?? '')"></div>
+                <div class="mt-1 text-sm text-error" x-show="selected?.error" x-text="selected?.error"></div>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
     </div>
 
-    <div id="inspector" class="pointer-events-none fixed inset-0 z-30 hidden bg-bg/45 opacity-0 transition duration-200" aria-hidden="true">
-      <button id="inspector-backdrop" class="absolute inset-0 cursor-default" aria-label="Close request inspector"></button>
-      <aside class="absolute end-0 top-0 flex h-full w-full max-w-[440px] translate-x-6 flex-col border-s border-border bg-bg-raised shadow-2xl transition duration-200">
-        <div class="border-b border-border p-4">
-          <div class="flex items-center justify-between gap-3">
-            <div>
-              <p class="text-xs uppercase text-faint">Request inspector</p>
-              <h2 id="drawer-title" class="mt-1 text-lg font-semibold">Route decision</h2>
-            </div>
-            <button id="inspector-close" class="focus-ring inline-flex size-9 items-center justify-center rounded-lg border border-border bg-surface text-muted hover:text-text" aria-label="Close request inspector">
-              ×
-            </button>
-          </div>
-        </div>
-        <div class="scrollbar-subtle flex-1 overflow-y-auto p-4">
-          <div class="grid gap-3">
-            <div class="rounded-lg border border-border bg-surface p-3">
-              <div class="text-xs uppercase text-faint">Selected model</div>
-              <div id="drawer-model" class="mt-2 text-base font-semibold"></div>
-            </div>
-            <div class="grid grid-cols-3 gap-2">
-              <div class="rounded-lg border border-border bg-surface p-3">
-                <div class="text-xs text-faint">Cost</div>
-                <div id="drawer-cost" class="metric-value mt-2"></div>
-              </div>
-              <div class="rounded-lg border border-border bg-surface p-3">
-                <div class="text-xs text-faint">Latency</div>
-                <div id="drawer-latency" class="metric-value mt-2"></div>
-              </div>
-              <div class="rounded-lg border border-border bg-surface p-3">
-                <div class="text-xs text-faint">Tier</div>
-                <div id="drawer-tier" class="metric-value mt-2"></div>
-              </div>
-            </div>
-            <div class="rounded-lg border border-border bg-surface p-3">
-              <div class="mb-3 flex items-center gap-2 text-sm font-medium">
-                <CheckCircle2 size={16} class="text-success" />
-                Decision path
-              </div>
-              <ol class="grid gap-2 text-sm text-muted">
-                <li class="rounded-md bg-bg-raised p-2">Input tokens estimated and task classified.</li>
-                <li class="rounded-md bg-bg-raised p-2">Policy constraints applied before provider forwarding.</li>
-                <li id="drawer-reason" class="rounded-md bg-bg-raised p-2"></li>
-              </ol>
-            </div>
-          </div>
-        </div>
-      </aside>
-    </div>
+    <noscript>
+      <p style="padding:1rem;color:#ddd;background:#1a1a1a">The llmux dashboard needs JavaScript to load live telemetry from the Stats API.</p>
+    </noscript>
 
     <script>
-      const inspector = document.querySelector('#inspector');
-      const closeButton = document.querySelector('#inspector-close');
-      const backdrop = document.querySelector('#inspector-backdrop');
-      const fields = {
-        title: document.querySelector('#drawer-title'),
-        model: document.querySelector('#drawer-model'),
-        cost: document.querySelector('#drawer-cost'),
-        latency: document.querySelector('#drawer-latency'),
-        tier: document.querySelector('#drawer-tier'),
-        reason: document.querySelector('#drawer-reason'),
-      };
+      import Alpine from 'alpinejs';
+      import { dashboard } from '../lib/dashboard';
 
-      function openInspector(row) {
-        const data = JSON.parse(row.dataset.request || '{}');
-        fields.title.textContent = `${data.task || 'request'} · ${data.status || 'unknown'}`;
-        fields.model.textContent = data.model || '-';
-        fields.cost.textContent = data.cost || '-';
-        fields.latency.textContent = data.latency || '-';
-        fields.tier.textContent = data.tier ? String(data.tier) : '-';
-        fields.reason.textContent = data.reason || 'No routing reason recorded.';
-        inspector.classList.remove('hidden');
-        requestAnimationFrame(() => {
-          inspector.classList.remove('pointer-events-none', 'opacity-0');
-          inspector.querySelector('aside').classList.remove('translate-x-6');
-          inspector.setAttribute('aria-hidden', 'false');
-        });
-      }
-
-      function closeInspector() {
-        inspector.classList.add('pointer-events-none', 'opacity-0');
-        inspector.querySelector('aside').classList.add('translate-x-6');
-        inspector.setAttribute('aria-hidden', 'true');
-        window.setTimeout(() => inspector.classList.add('hidden'), 200);
-      }
-
-      document.querySelectorAll('[data-request-row]').forEach((row) => {
-        row.addEventListener('click', (event) => {
-          if (event.target.closest('button') || event.currentTarget === row) {
-            openInspector(row);
-          }
-        });
-      });
-      closeButton.addEventListener('click', closeInspector);
-      backdrop.addEventListener('click', closeInspector);
-      document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape' && inspector.getAttribute('aria-hidden') === 'false') {
-          closeInspector();
-        }
-      });
+      window.Alpine = Alpine;
+      Alpine.data('dashboard', dashboard);
+      Alpine.start();
     </script>
   </body>
 </html>

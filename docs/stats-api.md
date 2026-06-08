@@ -5,13 +5,12 @@ the future embedded UI (#20). All values are derived from real log data.
 
 ## Authentication
 
-The same gateway key as the proxy. If `auth.llmux_key` is set in the config, every
-request must send `Authorization: Bearer <key>`; otherwise it gets `401`. When no
-key is configured, the endpoints are open (consistent with the proxy).
+**None.** The Stats API is read-only and llmux is a local instance, so these endpoints
+are open — the browser dashboard reads them same-origin without a token. The proxy
+(`/v1/...`) stays authenticated with `auth.llmux_key`.
 
 ```bash
-curl -fsS -H "Authorization: Bearer $LLMUX_KEY" \
-  http://localhost:3456/api/stats/overview
+curl -fsS http://localhost:3456/api/stats/overview
 ```
 
 ## Endpoints
@@ -240,3 +239,23 @@ Per-model p50/p95 is available in `/api/stats/models`.
 Percentiles are nearest-rank. `samples` is the number of latency observations in
 that group. Latency affects *routing* only under the `interactive` profile
 (`x-llmux-profile` / `routing.default_profile`); otherwise it is reporting-only.
+
+### `GET /api/stats/budget-series`
+
+Hourly real cost over the last 24 hours (oldest → newest), gaps filled with `0`, plus
+the configured cap thresholds. Drives the dashboard's budget-pressure chart.
+
+```json
+{
+  "buckets": [
+    { "hour": "2026-06-08T12:00", "cost": 0.0, "requests": 0 },
+    { "hour": "2026-06-08T13:00", "cost": 0.21, "requests": 12 }
+  ],
+  "daily_max_usd": 2.0,
+  "monthly_max_usd": 50.0,
+  "spent_today": 1.27
+}
+```
+
+`hour` is a UTC hour bucket (`%Y-%m-%dT%H:00`). The series always has exactly 24
+buckets. `daily_max_usd` / `monthly_max_usd` are `null` when unset.

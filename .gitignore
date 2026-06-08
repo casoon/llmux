@@ -7,3 +7,5 @@
 .env
 .claude/
 config/llmux.yaml
+/test-results
+/playwright-report
