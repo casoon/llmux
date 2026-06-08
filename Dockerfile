@@ -1,5 +1,16 @@
 # syntax=docker/dockerfile:1
 
+# ---- Dashboard build stage ----
+# Baut das Astro-Dashboard nach dist/dashboard; wird unten ins Rust-Binary eingebettet
+# (#20). Zur Laufzeit ist kein Node nötig.
+FROM node:22-bookworm-slim AS dashboard
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY astro.config.mjs tsconfig.json ./
+COPY dashboard ./dashboard
+RUN npm run build
+
 # ---- Build stage ----
 FROM rust:1-bookworm AS builder
 WORKDIR /app
@@ -7,14 +18,15 @@ WORKDIR /app
 # Abhängigkeiten zuerst auflösen und cachen (Layer bleibt stabil, solange sich
 # Cargo.toml/Cargo.lock nicht ändern). rusqlite baut SQLite gebündelt (C-Compiler
 # ist im rust-Image vorhanden).
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src \
     && echo "fn main() {}" > src/main.rs \
     && cargo build --release \
     && rm -rf src
 
-# Eigentliche Quellen bauen.
+# Eigentliche Quellen + gebautes Dashboard (rust-embed bettet dist/dashboard ein).
 COPY src ./src
+COPY --from=dashboard /app/dist/dashboard ./dist/dashboard
 RUN touch src/main.rs && cargo build --release
 
 # ---- Runtime stage ----
