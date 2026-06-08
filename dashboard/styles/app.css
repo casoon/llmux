@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+/* Alpine: hide x-cloak elements until the component is initialized (#19). */
+[x-cloak] {
+  display: none !important;
+}
+
 @theme {
   --font-sans: "Inter", "SF Pro Display", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", ui-monospace, monospace;

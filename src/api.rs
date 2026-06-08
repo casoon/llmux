@@ -70,6 +70,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/stats/projects", get(stats_projects))
         .route("/api/stats/quality", get(stats_quality))
         .route("/api/stats/latency", get(stats_latency))
+        .route("/api/stats/budget-series", get(stats_budget_series))
         .with_state(state)
 }
 
@@ -79,10 +80,10 @@ struct RequestsQuery {
     limit: Option<usize>,
 }
 
-async fn stats_overview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !check_auth(&state.cfg, &headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
-    }
+// Hinweis: Die read-only Stats-API (`/api/stats/*`) ist bewusst NICHT auth-pflichtig.
+// llmux ist eine lokale Instanz; das eingebettete Dashboard (#19/#20) ruft diese
+// Endpunkte vom Browser aus same-origin auf. Der Proxy (`/v1/...`) bleibt auth-pflichtig.
+async fn stats_overview(State(state): State<Arc<AppState>>) -> Response {
     let mut v = state.store.stats_overview();
     if let Some(o) = v.as_object_mut() {
         o.insert("cost_today".into(), json!(state.store.spent_today()));
@@ -99,49 +100,42 @@ async fn stats_overview(State(state): State<Arc<AppState>>, headers: HeaderMap) 
 
 async fn stats_requests(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Query(q): Query<RequestsQuery>,
 ) -> Response {
-    if !check_auth(&state.cfg, &headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
-    }
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     Json(json!({ "requests": state.store.recent_requests(limit) })).into_response()
 }
 
-async fn stats_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !check_auth(&state.cfg, &headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
-    }
+async fn stats_models(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({ "models": state.store.model_stats() })).into_response()
 }
 
-async fn stats_policy(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !check_auth(&state.cfg, &headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
-    }
+async fn stats_policy(State(state): State<Arc<AppState>>) -> Response {
     Json(state.store.policy_stats()).into_response()
 }
 
-async fn stats_projects(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !check_auth(&state.cfg, &headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
-    }
+async fn stats_projects(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({ "projects": state.store.project_stats() })).into_response()
 }
 
-async fn stats_quality(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !check_auth(&state.cfg, &headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
-    }
+async fn stats_quality(State(state): State<Arc<AppState>>) -> Response {
     Json(state.store.quality_stats()).into_response()
 }
 
-async fn stats_latency(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !check_auth(&state.cfg, &headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
-    }
+async fn stats_latency(State(state): State<Arc<AppState>>) -> Response {
     Json(state.store.latency_stats()).into_response()
+}
+
+/// Budget-Zeitreihe (#19): Kosten je Stunde der letzten 24 h plus die Cap-Schwellen,
+/// damit das Dashboard den Budgetdruck über die Zeit statt nur als Skalar zeigt.
+async fn stats_budget_series(State(state): State<Arc<AppState>>) -> Response {
+    Json(json!({
+        "buckets": state.store.budget_series(24),
+        "daily_max_usd": state.cfg.budgets.daily_max_usd,
+        "monthly_max_usd": state.cfg.budgets.monthly_max_usd,
+        "spent_today": state.store.spent_today(),
+    }))
+    .into_response()
 }
 
 async fn chat_completions(
@@ -1566,14 +1560,13 @@ classification:
         let client = reqwest::Client::new();
         let base = format!("http://{addr}");
 
-        // Ohne Key -> 401.
+        // Read-only Stats-API ist offen (lokale Instanz, #19) — auch ohne Key 200.
         let unauth = client.get(format!("{base}/api/stats/overview")).send().await.unwrap();
-        assert_eq!(unauth.status(), 401);
+        assert_eq!(unauth.status(), 200);
 
-        // Mit Key -> Overview mit erwarteten Feldern.
+        // Overview mit erwarteten Feldern (Key optional, wird ignoriert).
         let ov: Value = client
             .get(format!("{base}/api/stats/overview"))
-            .bearer_auth("secret")
             .send().await.unwrap()
             .json().await.unwrap();
         assert_eq!(ov["total_requests"], 3);

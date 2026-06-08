@@ -44,7 +44,7 @@ Intent-based local LLM router. llmux sits as an OpenAI-compatible proxy between 
 - **Streaming passthrough** (`stream: true`)
 - **SQLite logging** of every request (model, tier, tokens, cost, budget pressure, `degraded`, fallback, `attempts`, `attempt_trail`, `cache_hit`, `stop_reason`, session, errors)
 
-Not yet included (by design): dashboard wired to live data, multi-user.
+Not yet included (by design): dashboard embedded into the binary (served standalone for now), multi-user.
 
 > **Note:** Verified against mock providers only so far. Real end-to-end tests are on the roadmap.
 
@@ -197,18 +197,45 @@ sqlite3 data/llmux.sqlite \
 
 ## Stats API
 
-Read-only JSON endpoints over the request log, authenticated with the same
-`auth.llmux_key` as the proxy:
+Read-only JSON endpoints over the request log. These are **open** (no auth): llmux is
+a local instance and the dashboard reads them same-origin from the browser. The proxy
+(`/v1/...`) stays authenticated with `auth.llmux_key`.
 
 - `GET /api/stats/overview` — requests/min, cost today/month, budget pressure, cache hit rate, p95 latency
 - `GET /api/stats/requests?limit=50` — recent route decisions (live feed / inspector)
-- `GET /api/stats/models` — per-model cost, latency p50/p95, success/error/fallback/cache rates
+- `GET /api/stats/models` — per-model cost, success/error/fallback/cache rates, avg tier
 - `GET /api/stats/policy` — allowed/rejected/degraded/fallback/cached/forced/local-only counts + top rejection reasons
 - `GET /api/stats/projects` — per-project requests, cost, rejects, forced, local-only
 - `GET /api/stats/quality` — per-model/task reliability proxies: success/error/fallback rates, stop-reason distribution, "tools expected but no tool call", error clusters (operational signals, not semantic evaluation)
 - `GET /api/stats/latency` — p50/p95 latency by provider and task type, plus cache-hit vs provider latency
+- `GET /api/stats/budget-series` — hourly cost over the last 24h plus the cap thresholds (drives the budget-pressure chart)
 
 Response shapes are documented in **[docs/stats-api.md](docs/stats-api.md)**.
+
+## Dashboard
+
+A read-only operational dashboard (Astro static + Tailwind v4 + Alpine.js) lives under
+`dashboard/` and renders live telemetry from the Stats API: KPI strip, live route feed
+with search / result / time-window filters, policy radar, budget-pressure chart, model
+matrix, projects, and a request inspector drawer (classification, provider-attempt chain,
+cost, latency, cache/fallback/forced status).
+
+```bash
+npm install
+npm run build          # → dist/dashboard/ (static)
+npm run dev            # local dev server
+npm run check          # astro type-check
+npm run test:e2e       # Playwright smoke + a11y (axe) tests
+```
+
+The dashboard fetches the Stats API **same-origin** by default (this is how the embedded
+build, #20, serves it). For local dev against a separately running llmux, point it at the
+instance with a `?api=` query parameter, e.g. `http://localhost:4321/?api=http://127.0.0.1:8080`
+(persisted to `localStorage`). It has loading / error / empty / stale states, is responsive
+(mobile → desktop; tables scroll inside their panels), and passes an axe WCAG 2 A/AA scan
+plus keyboard-operability checks (focusable rows, Enter/Space to open the inspector, Escape
+to close). The Playwright smoke test covers panel rendering, the inspector interaction, and
+asserts no console errors.
 
 ## License
 

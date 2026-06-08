@@ -296,6 +296,46 @@ impl Store {
         self.spent_since(&since)
     }
 
+    /// Stündliche Kosten/Request-Zahl der letzten `hours` Stunden (#19). Lücken werden
+    /// mit 0 aufgefüllt, sodass die Reihe genau `hours` Buckets (alt → neu) hat.
+    pub fn budget_series(&self, hours: i64) -> Vec<Value> {
+        let hours = hours.clamp(1, 168);
+        let now = chrono::Utc::now();
+        let labels: Vec<String> = (0..hours)
+            .rev()
+            .map(|i| (now - chrono::Duration::hours(i)).format("%Y-%m-%dT%H:00").to_string())
+            .collect();
+
+        let conn = self.conn.lock().unwrap();
+        let since = labels.first().cloned().unwrap_or_default();
+        let mut by_hour: HashMap<String, (f64, i64)> = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT strftime('%Y-%m-%dT%H:00', ts) AS h, SUM(real_cost_usd), COUNT(*) \
+             FROM requests WHERE ts >= ?1 GROUP BY h",
+        ) {
+            let rows = stmt.query_map([since], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                    r.get::<_, i64>(2)?,
+                ))
+            });
+            if let Ok(rows) = rows {
+                for (h, cost, n) in rows.flatten() {
+                    by_hour.insert(h, (cost, n));
+                }
+            }
+        }
+
+        labels
+            .into_iter()
+            .map(|h| {
+                let (cost, n) = by_hour.get(&h).copied().unwrap_or((0.0, 0));
+                json!({ "hour": h, "cost": cost, "requests": n })
+            })
+            .collect()
+    }
+
     fn spent_since(&self, since_rfc3339: &str) -> f64 {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -851,6 +891,29 @@ mod tests {
             .unwrap();
         }
         assert_eq!(s.evict_expired_cache(), 1); // nur die abgelaufene semantische Zeile
+    }
+
+    // #19: Die Budget-Reihe hat genau `hours` Buckets (alt → neu); eine soeben
+    // geloggte Zeile landet im aktuellen (letzten) Bucket.
+    #[test]
+    fn budget_series_buckets_and_attributes_cost() {
+        let s = store();
+        assert_eq!(s.budget_series(24).len(), 24);
+
+        s.insert(&RequestLog {
+            tool: "t".into(),
+            status: 200,
+            real_cost_usd: 0.05,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let series = s.budget_series(24);
+        assert_eq!(series.len(), 24);
+        let total: f64 = series.iter().map(|b| b["cost"].as_f64().unwrap()).sum();
+        assert!((total - 0.05).abs() < 1e-9, "series total cost = {total}");
+        // Die frische Zeile liegt im letzten (aktuellen) Bucket.
+        assert!((series.last().unwrap()["cost"].as_f64().unwrap() - 0.05).abs() < 1e-9);
     }
 
     #[test]
