@@ -106,6 +106,51 @@ pub fn requires_tools(body: &Value) -> bool {
     has_tool_defs || forces_tool || history_has_tools
 }
 
+/// Aus dem Request abgeleitete Modell-Fähigkeiten jenseits von Tools (#31):
+/// `json_schema`, wenn ein `response_format` (json_schema/json_object) gesetzt ist,
+/// und `vision`, wenn eine Message Bild-Content-Parts enthält. Tools werden separat
+/// über [`requires_tools`] erkannt. Das Ergebnis wird im Selektor zur Pflicht-
+/// Capability-Anforderung; Modelle ohne die Fähigkeit fallen aus.
+pub fn request_capabilities(body: &Value) -> Vec<String> {
+    let mut caps = Vec::new();
+
+    let needs_json = body
+        .get("response_format")
+        .and_then(|rf| rf.get("type"))
+        .and_then(Value::as_str)
+        .map(|t| t == "json_schema" || t == "json_object")
+        .unwrap_or(false);
+    if needs_json {
+        caps.push("json_schema".to_string());
+    }
+
+    let has_image = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|msgs| msgs.iter().any(message_has_image))
+        .unwrap_or(false);
+    if has_image {
+        caps.push("vision".to_string());
+    }
+
+    caps
+}
+
+/// True, wenn der Content einer Message Bild-Parts trägt (`image_url`/`image`).
+fn message_has_image(msg: &Value) -> bool {
+    msg.get("content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts.iter().any(|p| {
+                matches!(
+                    p.get("type").and_then(Value::as_str),
+                    Some("image_url") | Some("image") | Some("input_image")
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
@@ -146,5 +191,31 @@ mod tests {
     fn plain_chat_requires_no_tools() {
         let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
         assert!(!requires_tools(&body));
+    }
+
+    #[test]
+    fn detects_json_schema_capability() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "response_format": { "type": "json_schema", "json_schema": { "name": "x" } }
+        });
+        assert_eq!(request_capabilities(&body), vec!["json_schema"]);
+    }
+
+    #[test]
+    fn detects_vision_capability() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "what is this" },
+                { "type": "image_url", "image_url": { "url": "data:..." } }
+            ] }]
+        });
+        assert_eq!(request_capabilities(&body), vec!["vision"]);
+    }
+
+    #[test]
+    fn plain_request_has_no_extra_capabilities() {
+        let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        assert!(request_capabilities(&body).is_empty());
     }
 }

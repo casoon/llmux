@@ -12,6 +12,10 @@ mod privacy;
 mod providers;
 mod router;
 
+/// Deterministische Routing-Eval-Fixtures (Klassifikator + Selektor-Kalibrierung).
+#[cfg(test)]
+mod eval;
+
 use std::sync::Arc;
 
 use api::AppState;

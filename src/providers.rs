@@ -143,25 +143,65 @@ pub async fn forward(
 }
 
 /// Übersetzt einen OpenAI-`chat/completions`-Body in einen Anthropic-`/messages`-Body.
-/// system-Messages werden zum Top-Level-`system`; user/assistant bleiben als Messages.
+///
+/// system-Messages werden zum Top-Level-`system`. Der Tool-Zustand eines Agent-Loops
+/// bleibt erhalten (#26): assistant-`tool_calls` werden zu `tool_use`-Blöcken,
+/// `role: tool`-Messages zu `tool_result`-Blöcken mit passender `tool_use_id`.
+/// Aufeinanderfolgende Messages gleicher Rolle (z. B. parallele Tool-Resultate)
+/// werden zusammengeführt, da Anthropic strikt alternierende Rollen erwartet.
 pub fn to_anthropic_request(body: &Value, model: &str) -> Value {
     let mut system = String::new();
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(arr) = body.get("messages").and_then(Value::as_array) {
         for m in arr {
-            let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
-            let text = message_text(m);
-            if role == "system" {
-                if !system.is_empty() {
-                    system.push('\n');
+            match m.get("role").and_then(Value::as_str).unwrap_or("user") {
+                "system" => {
+                    let text = message_text(m);
+                    if !text.is_empty() {
+                        if !system.is_empty() {
+                            system.push('\n');
+                        }
+                        system.push_str(&text);
+                    }
                 }
-                system.push_str(&text);
-            } else {
-                let r = if role == "assistant" { "assistant" } else { "user" };
-                messages.push(json!({ "role": r, "content": text }));
+                "assistant" => {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    let text = message_text(m);
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                    if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+                        blocks.extend(calls.iter().map(openai_tool_call_to_anthropic));
+                    }
+                    push_blocks(&mut messages, "assistant", blocks);
+                }
+                "tool" => {
+                    let id = m.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+                    let block = json!({
+                        "type": "tool_result",
+                        "tool_use_id": id,
+                        "content": message_text(m)
+                    });
+                    push_blocks(&mut messages, "user", vec![block]);
+                }
+                _ => {
+                    let text = message_text(m);
+                    let blocks = if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![json!({ "type": "text", "text": text })]
+                    };
+                    push_blocks(&mut messages, "user", blocks);
+                }
             }
         }
+    }
+
+    // Eine reine Einzel-Text-Message zur kompakten String-Form kollabieren
+    // (Anthropic akzeptiert beides; hält die Payload schlank und kompatibel).
+    for msg in &mut messages {
+        collapse_single_text(msg);
     }
 
     let max_tokens = body
@@ -264,6 +304,61 @@ fn message_text(msg: &Value) -> String {
     }
 }
 
+/// Hängt eine Content-Block-Liste als Message der Rolle `role` an. Ist die letzte
+/// Message bereits dieselbe Rolle, werden die Blöcke zusammengeführt — Anthropic
+/// erlaubt nur alternierende user/assistant-Rollen (#26). Leere Blocklisten werden
+/// übersprungen.
+fn push_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(last) = messages.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some(role) {
+            if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+                arr.extend(blocks);
+                return;
+            }
+        }
+    }
+    messages.push(json!({ "role": role, "content": blocks }));
+}
+
+/// Kollabiert eine Message, deren Content genau ein Text-Block ist, zur String-Form.
+fn collapse_single_text(msg: &mut Value) {
+    let text = {
+        let Some(arr) = msg.get("content").and_then(Value::as_array) else {
+            return;
+        };
+        if arr.len() != 1 || arr[0].get("type").and_then(Value::as_str) != Some("text") {
+            return;
+        }
+        match arr[0].get("text").and_then(Value::as_str) {
+            Some(t) => t.to_string(),
+            None => return,
+        }
+    };
+    if let Some(o) = msg.as_object_mut() {
+        o.insert("content".into(), Value::String(text));
+    }
+}
+
+/// OpenAI-`tool_call` (`{id, function:{name, arguments(JSON-String)}}`)
+/// -> Anthropic-`tool_use`-Block (`{type, id, name, input(JSON-Objekt)}`).
+fn openai_tool_call_to_anthropic(tc: &Value) -> Value {
+    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+    let f = tc.get("function");
+    let name = f
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let input = f
+        .and_then(|f| f.get("arguments"))
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| json!({}));
+    json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+}
+
 /// OpenAI-Tool (`{type:"function", function:{name,description,parameters}}`)
 /// -> Anthropic-Tool (`{name, description, input_schema}`).
 fn openai_tool_to_anthropic(tool: &Value) -> Option<Value> {
@@ -337,6 +432,74 @@ mod tests {
         assert_eq!(out["usage"]["prompt_tokens"], 12);
         assert_eq!(out["usage"]["completion_tokens"], 7);
         assert_eq!(out["usage"]["total_tokens"], 19);
+    }
+
+    #[test]
+    fn request_maps_assistant_tool_calls_to_tool_use() {
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": "search x" },
+                { "role": "assistant", "content": "", "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "search", "arguments": "{\"q\":\"x\"}" } }
+                ] }
+            ]
+        });
+        let out = to_anthropic_request(&body, "claude-x");
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs[1]["role"], "assistant");
+        let block = &msgs[1]["content"][0];
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["id"], "call_1");
+        assert_eq!(block["name"], "search");
+        // arguments-String wurde zu einem JSON-Objekt geparst.
+        assert_eq!(block["input"]["q"], "x");
+    }
+
+    #[test]
+    fn request_maps_tool_role_to_tool_result() {
+        let body = json!({
+            "messages": [
+                { "role": "assistant", "content": "", "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "search", "arguments": "{}" } }
+                ] },
+                { "role": "tool", "tool_call_id": "call_1", "content": "result text" }
+            ]
+        });
+        let out = to_anthropic_request(&body, "claude-x");
+        let msgs = out["messages"].as_array().unwrap();
+        let last = msgs.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"][0]["type"], "tool_result");
+        assert_eq!(last["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(last["content"][0]["content"], "result text");
+    }
+
+    #[test]
+    fn request_preserves_text_with_tool_use_and_merges_parallel_results() {
+        let body = json!({
+            "messages": [
+                { "role": "assistant", "content": "let me check", "tool_calls": [
+                    { "id": "a", "type": "function", "function": { "name": "f", "arguments": "{}" } },
+                    { "id": "b", "type": "function", "function": { "name": "g", "arguments": "{}" } }
+                ] },
+                { "role": "tool", "tool_call_id": "a", "content": "ra" },
+                { "role": "tool", "tool_call_id": "b", "content": "rb" }
+            ]
+        });
+        let out = to_anthropic_request(&body, "claude-x");
+        let msgs = out["messages"].as_array().unwrap();
+        // assistant: Text-Block bleibt neben den beiden tool_use-Blöcken erhalten.
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(msgs[0]["content"][0]["text"], "let me check");
+        assert_eq!(msgs[0]["content"][1]["type"], "tool_use");
+        assert_eq!(msgs[0]["content"][2]["type"], "tool_use");
+        // Beide Tool-Resultate sind zu einer einzigen user-Message zusammengeführt.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[1]["content"][0]["tool_use_id"], "a");
+        assert_eq!(msgs[1]["content"][1]["tool_use_id"], "b");
     }
 
     fn keys(weights: &[f64]) -> Vec<ResolvedKey> {

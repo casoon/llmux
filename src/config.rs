@@ -23,8 +23,15 @@ pub struct Config {
     /// Wird vor der Auswahl auf `x-llmux-model` und das `model`-Feld des Requests angewandt.
     #[serde(default)]
     pub aliases: HashMap<String, String>,
+    /// Projekt-Scopes (`projects.<name>`): pro Projekt zusätzliche Routing-Regeln,
+    /// aufgelöst über den `x-llmux-project`-Header. Leer = kein Scope (Default). (#33)
+    #[serde(default)]
+    pub projects: HashMap<String, ProjectProfile>,
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Routing-Profil-Defaults (Latenz vs. Kosten, #30).
+    #[serde(default)]
+    pub routing: RoutingConfig,
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
@@ -44,6 +51,39 @@ impl Default for ClassifierConfig {
     fn default() -> Self {
         Self { user_messages: 1 }
     }
+}
+
+/// Routing-Profil: priorisiert bei sonst gleichen harten Filtern Kosten oder
+/// Latenz (#30). Nur `interactive` weicht von cheapest-viable ab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    /// Niedrigste erwartete Latenz zuerst (Kosten als Tiebreak).
+    Interactive,
+    /// Günstigstes gültiges Modell (Standard).
+    #[default]
+    Balanced,
+    /// Wie Balanced (Kosten dominieren); Platzhalter für aggressivere Kostenwahl.
+    Batch,
+}
+
+impl Profile {
+    /// Parst einen Profilnamen (case-insensitive); None bei unbekanntem Wert.
+    pub fn parse(s: &str) -> Option<Profile> {
+        match s.to_ascii_lowercase().as_str() {
+            "interactive" => Some(Profile::Interactive),
+            "balanced" => Some(Profile::Balanced),
+            "batch" => Some(Profile::Batch),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// Profil, wenn der Request keinen `x-llmux-profile`-Header setzt.
+    pub default_profile: Profile,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +246,21 @@ pub enum ProviderKind {
     Anthropic,
 }
 
+/// Bekannte Modell-Fähigkeiten. `tools`/`json_schema`/`vision` werden aus dem
+/// Request automatisch als Anforderung erkannt; alle bekannten Namen können von
+/// Task-Regeln über `require_capabilities` verlangt werden. Unbekannte Namen in der
+/// Config werden von [`Config::validate`] abgewiesen (#31).
+pub const KNOWN_CAPABILITIES: &[&str] = &[
+    "tools",
+    "json_schema",
+    "vision",
+    "streaming",
+    "streaming_usage",
+    "large_context",
+    "reasoning",
+    "strict_tool_schema",
+];
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
     pub provider: String,
@@ -214,8 +269,13 @@ pub struct ModelEntry {
     pub tier: u8,
     /// Kontextfenster in Tokens.
     pub context: u64,
+    /// Kompatibilitäts-Sugar: entspricht der Capability `tools` (#31).
     #[serde(default)]
     pub supports_tools: bool,
+    /// Explizite Fähigkeiten dieses Modells (siehe [`KNOWN_CAPABILITIES`]). `tools`
+    /// ist auch über `supports_tools` ausdrückbar.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
     /// Zusätzlich zu den Provider-weiten `strip_params` für dieses Modell zu entfernende Felder.
@@ -230,6 +290,15 @@ impl ModelEntry {
             model: self.model.clone(),
         }
     }
+
+    /// True, wenn das Modell die Fähigkeit `cap` bietet. `tools` schließt das
+    /// Kompatibilitäts-Flag `supports_tools` ein (#31).
+    pub fn has_capability(&self, cap: &str) -> bool {
+        if cap == "tools" && self.supports_tools {
+            return true;
+        }
+        self.capabilities.iter().any(|c| c == cap)
+    }
     /// Geschätzte Kosten in USD für gegebene Input-/Output-Tokens.
     pub fn est_cost(&self, input_tokens: u64, output_tokens: u64) -> f64 {
         input_tokens as f64 / 1_000_000.0 * self.input_per_mtok
@@ -243,6 +312,32 @@ pub struct Target {
     pub model: String,
 }
 
+/// Projekt-skopierte Routing-Regeln (#33). Werden vor der Auswahl mit der Task-
+/// Policy verschmolzen; alle Felder sind optional und ändern das Default-Verhalten
+/// nur, wenn gesetzt. Erzwungene Overrides umgehen diese Regeln nicht.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ProjectProfile {
+    /// Erzwingt lokale Provider (wie Privacy-`local_only`), zusätzlich zur Task-Regel.
+    pub local_only: bool,
+    /// Hebt den Qualitäts-Floor an: effektives `min_tier` = max(Task, Projekt).
+    pub min_tier: Option<u8>,
+    /// Nur diese Provider sind erlaubt (leer = keine Einschränkung).
+    pub require_providers: Vec<String>,
+    /// Diese Provider sind für das Projekt gesperrt.
+    pub forbid_providers: Vec<String>,
+}
+
+impl ProjectProfile {
+    /// True, wenn `provider` unter den Projektregeln zulässig ist.
+    pub fn allows_provider(&self, provider: &str) -> bool {
+        if self.forbid_providers.iter().any(|p| p == provider) {
+            return false;
+        }
+        self.require_providers.is_empty() || self.require_providers.iter().any(|p| p == provider)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskRule {
     /// Mindest-Tier für diese Aufgabe (Qualitäts-Floor).
@@ -250,6 +345,9 @@ pub struct TaskRule {
     /// Aufgabe braucht zwingend Tool-Calling.
     #[serde(default)]
     pub require_tools: bool,
+    /// Aufgabe verlangt zusätzliche Modell-Fähigkeiten (siehe [`KNOWN_CAPABILITIES`]). (#31)
+    #[serde(default)]
+    pub require_capabilities: Vec<String>,
     /// Aufgabe darf nur an lokale Provider (Privacy).
     #[serde(default)]
     pub local_only: bool,
@@ -273,26 +371,28 @@ impl Config {
         Ok(cfg)
     }
 
-    /// True, wenn der Provider nutzbar ist (aktiviert und ggf. Key gesetzt).
-    pub fn provider_ready(&self, provider: &str) -> bool {
+    /// True, wenn der Provider für genau dieses Modell nutzbar ist: aktiviert und
+    /// mindestens ein für das Modell freigegebener Key gesetzt (oder Provider ohne
+    /// Auth). Deckt sich mit `providers::resolve_keys`, sodass der Selektor kein
+    /// Modell wählt, dessen Provider global „ready" ist, aber für dieses Modell
+    /// keinen brauchbaren Key hat — der Fehler fiele sonst erst beim Forwarding auf (#27).
+    pub fn provider_ready_for_model(&self, provider: &str, model: &str) -> bool {
         let Some(p) = self.providers.get(provider) else {
             return false;
         };
         if !p.enabled {
             return false;
         }
-        if !p.keys.is_empty() {
-            // Bereit, sobald mindestens ein Key seine Env-Variable gesetzt hat.
-            return p.keys.iter().any(|k| std::env::var(&k.env).is_ok());
-        }
-        match &p.api_key_env {
-            Some(env) => std::env::var(env).is_ok(),
-            None => true,
-        }
+        !crate::providers::resolve_keys(p, model).is_empty()
     }
 
     pub fn provider_is_local(&self, provider: &str) -> bool {
         self.providers.get(provider).map(|p| p.local).unwrap_or(false)
+    }
+
+    /// Projekt-Profil für den `x-llmux-project`-Wert (None = kein Scope). (#33)
+    pub fn project_profile(&self, name: &str) -> Option<&ProjectProfile> {
+        self.projects.get(name)
     }
 
     pub fn provider_kind(&self, provider: &str) -> ProviderKind {
@@ -355,30 +455,65 @@ impl Config {
             }
         }
 
-        // 3. Jede Routing-Anforderung ist erfüllbar: mindestens ein Modell, das
-        //    Tier-Floor, Tool- und Local-Zwang der Regel gleichzeitig erfüllt.
+        // 3. Unbekannte Capability-Namen in Katalog und Task-Regeln abweisen (#31).
+        let known_cap = |c: &String| KNOWN_CAPABILITIES.contains(&c.as_str());
+        for m in &self.models {
+            for c in m.capabilities.iter().filter(|c| !known_cap(c)) {
+                errors.push(format!(
+                    "Modell '{}' deklariert unbekannte Capability '{c}'",
+                    m.model
+                ));
+            }
+        }
+        for (key, rule) in &self.classification {
+            for c in rule.require_capabilities.iter().filter(|c| !known_cap(c)) {
+                errors.push(format!(
+                    "task_type '{key}' verlangt unbekannte Capability '{c}'"
+                ));
+            }
+        }
+
+        // 4. Jede Routing-Anforderung ist erfüllbar: mindestens ein Modell, das
+        //    Tier-Floor, Tool-/Capability- und Local-Zwang gleichzeitig erfüllt.
         for (key, rule) in &self.classification {
             let satisfiable = self.models.iter().any(|m| {
                 m.tier >= rule.min_tier
-                    && (!rule.require_tools || m.supports_tools)
+                    && (!rule.require_tools || m.has_capability("tools"))
+                    && rule.require_capabilities.iter().all(|c| m.has_capability(c))
                     && (!rule.local_only || self.provider_is_local(&m.provider))
             });
             if !satisfiable {
                 errors.push(format!(
-                    "task_type '{key}' ist nicht erfüllbar: kein Modell mit tier>={}{}{}",
+                    "task_type '{key}' ist nicht erfüllbar: kein Modell mit tier>={}{}{}{}",
                     rule.min_tier,
                     if rule.require_tools { " + Tool-Support" } else { "" },
+                    if rule.require_capabilities.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" + Capabilities {:?}", rule.require_capabilities)
+                    },
                     if rule.local_only { " + lokalem Provider" } else { "" },
                 ));
             }
         }
 
-        // 4. Jeder Alias zeigt auf ein existierendes Katalogmodell.
+        // 5. Jeder Alias zeigt auf ein existierendes Katalogmodell.
         for (alias, target) in &self.aliases {
             if !self.is_catalog_model(target) {
                 errors.push(format!(
                     "Alias '{alias}' zeigt auf unbekanntes Modell '{target}'"
                 ));
+            }
+        }
+
+        // 6. Projekt-Scopes referenzieren nur definierte Provider.
+        for (name, profile) in &self.projects {
+            for p in profile.require_providers.iter().chain(&profile.forbid_providers) {
+                if !self.providers.contains_key(p) {
+                    errors.push(format!(
+                        "Projekt '{name}' referenziert unbekannten Provider '{p}'"
+                    ));
+                }
             }
         }
 
@@ -461,6 +596,39 @@ classification:
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.resolve_alias("best"), Some("big"));
         assert_eq!(cfg.resolve_alias("nope"), None);
+    }
+
+    #[test]
+    fn rejects_unknown_capability_name() {
+        let yaml = VALID.replace(
+            r#"supports_tools: true, input_per_mtok: 0.0, output_per_mtok: 0.0 }"#,
+            r#"supports_tools: true, capabilities: ["telepathy"], input_per_mtok: 0.0, output_per_mtok: 0.0 }"#,
+        );
+        let err = parse(&yaml).validate().unwrap_err().to_string();
+        assert!(err.contains("telepathy") && err.contains("unbekannte Capability"), "got: {err}");
+    }
+
+    #[test]
+    fn task_require_capability_satisfiable_and_unsatisfiable() {
+        // 'big' (tier5) bekommt vision; code_review (tier>=3) darf vision verlangen.
+        let ok = VALID
+            .replace(
+                r#"supports_tools: true, input_per_mtok: 1.0, output_per_mtok: 1.0 }"#,
+                r#"supports_tools: true, capabilities: ["vision"], input_per_mtok: 1.0, output_per_mtok: 1.0 }"#,
+            )
+            .replace(
+                "code_review:       { min_tier: 3 }",
+                r#"code_review:       { min_tier: 3, require_capabilities: ["vision"] }"#,
+            );
+        assert!(parse(&ok).validate().is_ok());
+
+        // simple_text verlangt vision, aber kein Modell kann es -> nicht erfüllbar.
+        let bad = VALID.replace(
+            "simple_text:       { min_tier: 1 }",
+            r#"simple_text:       { min_tier: 1, require_capabilities: ["vision"] }"#,
+        );
+        let err = parse(&bad).validate().unwrap_err().to_string();
+        assert!(err.contains("simple_text") && err.contains("nicht erfüllbar"), "got: {err}");
     }
 
     #[test]

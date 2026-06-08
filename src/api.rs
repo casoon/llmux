@@ -6,16 +6,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use serde::Deserialize;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::config::{Config, ModelEntry, ProviderKind, RetryConfig};
+use crate::config::{Config, ModelEntry, Profile, ProviderKind, RetryConfig};
 use crate::logging::{RequestLog, Store};
 use crate::router::{self, SelectError, SelectInput, SessionStore};
 use crate::{cache, classifier, cost, privacy, providers};
@@ -28,12 +29,19 @@ pub struct AppState {
 }
 
 /// Routing-Metadaten, unabhängig davon ob dynamisch gewählt oder per Header erzwungen.
+#[derive(Debug)]
 struct Plan {
     chain: Vec<ModelEntry>,
     tier: u8,
     degraded: bool,
     pressure: f64,
     expected_output: u64,
+    /// Modell wurde per Override erzwungen (Policy-Dimension, #28).
+    forced: bool,
+    /// Aufgelöster Projekt-Scope-Name aus `x-llmux-project` (für Logging, #33).
+    project: Option<String>,
+    /// Der Request erwartete Tool-Calling (Qualitätssignal, #29).
+    tools_expected: bool,
 }
 
 /// Klassifikation eines Provider-Fehlers für die Retry-/Fallback-Strategie.
@@ -47,7 +55,86 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/chat/completions", post(chat_completions))
+        // Read-only Stats-API (#18) — gleicher llmux_key wie der Proxy.
+        .route("/api/stats/overview", get(stats_overview))
+        .route("/api/stats/requests", get(stats_requests))
+        .route("/api/stats/models", get(stats_models))
+        .route("/api/stats/policy", get(stats_policy))
+        .route("/api/stats/projects", get(stats_projects))
+        .route("/api/stats/quality", get(stats_quality))
+        .route("/api/stats/latency", get(stats_latency))
         .with_state(state)
+}
+
+/// Query-Parameter für `/api/stats/requests`.
+#[derive(Debug, Deserialize)]
+struct RequestsQuery {
+    limit: Option<usize>,
+}
+
+async fn stats_overview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !check_auth(&state.cfg, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
+    }
+    let mut v = state.store.stats_overview();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("cost_today".into(), json!(state.store.spent_today()));
+        o.insert("cost_month".into(), json!(state.store.spent_this_month()));
+        o.insert(
+            "budget_pressure".into(),
+            json!(router::current_pressure(&state.cfg, &state.store)),
+        );
+        o.insert("daily_max_usd".into(), json!(state.cfg.budgets.daily_max_usd));
+        o.insert("monthly_max_usd".into(), json!(state.cfg.budgets.monthly_max_usd));
+    }
+    Json(v).into_response()
+}
+
+async fn stats_requests(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<RequestsQuery>,
+) -> Response {
+    if !check_auth(&state.cfg, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    Json(json!({ "requests": state.store.recent_requests(limit) })).into_response()
+}
+
+async fn stats_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !check_auth(&state.cfg, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
+    }
+    Json(json!({ "models": state.store.model_stats() })).into_response()
+}
+
+async fn stats_policy(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !check_auth(&state.cfg, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
+    }
+    Json(state.store.policy_stats()).into_response()
+}
+
+async fn stats_projects(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !check_auth(&state.cfg, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
+    }
+    Json(json!({ "projects": state.store.project_stats() })).into_response()
+}
+
+async fn stats_quality(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !check_auth(&state.cfg, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
+    }
+    Json(state.store.quality_stats()).into_response()
+}
+
+async fn stats_latency(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !check_auth(&state.cfg, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "ungültiger oder fehlender API-Key");
+    }
+    Json(state.store.latency_stats()).into_response()
 }
 
 async fn chat_completions(
@@ -62,6 +149,11 @@ async fn chat_completions(
     let started = Instant::now();
     let tool = header(&headers, "x-llmux-tool").unwrap_or_else(|| "unknown".into());
     let session = header(&headers, "x-llmux-session");
+    let project = header(&headers, "x-llmux-project");
+    // Routing-Profil: Header vor Config-Default; unbekannte Werte fallen auf Default (#30).
+    let profile = header(&headers, "x-llmux-profile")
+        .and_then(|p| Profile::parse(&p))
+        .unwrap_or(state.cfg.routing.default_profile);
     let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     // Beim Streaming reale Usage anfordern (finaler Chunk trägt prompt/completion_tokens).
@@ -90,6 +182,8 @@ async fn chat_completions(
     let input_tokens = cost::estimate_request_tokens(&body);
     let cached_prefix_tokens = cost::estimate_cached_prefix_tokens(&body);
     let requires_tools = classifier::requires_tools(&body);
+    // Aus dem Request abgeleitete Pflicht-Capabilities jenseits von Tools (#31).
+    let req_capabilities = classifier::request_capabilities(&body);
     // Privacy prüft eine breitere Oberfläche (User-/Tool-Content + Tool-Schemas) als
     // die Keyword-Klassifikation, die nur die letzte(n) User-Message(s) betrachtet
     // (#22/#23). Privacy hat Vorrang und erzwingt private_sensitive (-> local_only).
@@ -106,10 +200,10 @@ async fn chat_completions(
     let task_key = task.as_key();
 
     // Plan bestimmen: erzwungenes Modell oder dynamische Auswahl
-    let mut plan = match build_plan(&state, &force_model, task_key, requires_tools, input_tokens, cached_prefix_tokens, &session) {
+    let mut plan = match build_plan(&state, &force_model, task_key, requires_tools, &req_capabilities, input_tokens, cached_prefix_tokens, &session, &project, profile) {
         Ok(p) => p,
         Err(resp) => {
-            log_failure(&state.store, &tool, &session, task_key, input_tokens, "plan", resp.0.as_u16(), &resp.1);
+            log_failure(&state.store, &tool, &session, &project, task_key, input_tokens, "plan", resp.0.as_u16(), &resp.1, force_model.is_some());
             return error_response(resp.0, &resp.1);
         }
     };
@@ -123,7 +217,7 @@ async fn chat_completions(
     // Streaming für native Anthropic-Provider ist noch nicht implementiert (nur Nicht-Stream).
     if is_stream && state.cfg.provider_kind(&primary.provider) == ProviderKind::Anthropic {
         let msg = "Streaming wird für native Anthropic-Provider noch nicht unterstützt";
-        log_failure(&state.store, &tool, &session, task_key, input_tokens, "anthropic_stream", 400, msg);
+        log_failure(&state.store, &tool, &session, &project, task_key, input_tokens, "anthropic_stream", 400, msg, force_model.is_some());
         return error_response(StatusCode::BAD_REQUEST, msg);
     }
 
@@ -134,7 +228,7 @@ async fn chat_completions(
         let est = primary.est_cost(eff_input, plan.expected_output);
         if est > mc {
             let msg = format!("Schätzkosten {est:.5} USD über max-cost {mc:.5}");
-            log_failure(&state.store, &tool, &session, task_key, input_tokens, "max_cost", 402, &msg);
+            log_failure(&state.store, &tool, &session, &project, task_key, input_tokens, "max_cost", 402, &msg, force_model.is_some());
             return error_response(StatusCode::PAYMENT_REQUIRED, &msg);
         }
     }
@@ -168,6 +262,7 @@ async fn chat_completions(
         tools = requires_tools, input_tokens,
         pressure = format!("{:.2}", plan.pressure),
         candidates = plan.chain.len(), forced = force_model.is_some(),
+        project = project.as_deref().unwrap_or("-"),
         "routing"
     );
 
@@ -181,10 +276,18 @@ fn build_plan(
     force_model: &Option<String>,
     task_key: &str,
     requires_tools: bool,
+    req_capabilities: &[String],
     input_tokens: u64,
     cached_prefix_tokens: u64,
     session: &Option<String>,
+    project: &Option<String>,
+    profile: Profile,
 ) -> Result<Plan, (StatusCode, String)> {
+    // Projekt-Scope auflösen (#33). Unbekannte Projektnamen ändern nichts.
+    let profile_rules = project
+        .as_deref()
+        .and_then(|p| state.cfg.project_profile(p));
+
     if let Some(name) = force_model {
         let entry = state
             .cfg
@@ -196,13 +299,86 @@ fn build_plan(
                 StatusCode::BAD_REQUEST,
                 format!("erzwungenes Modell '{name}' nicht im Katalog"),
             ))?;
-        let expected_output = input_tokens;
+
+        // Ein erzwungenes Modell darf die günstigste-gültige Auswahl überspringen,
+        // nicht aber die harten Sicherheits-/Fähigkeitsbedingungen des Selektors (#25).
+        let rule = state.cfg.classification.get(task_key);
+        let need_tools = requires_tools || rule.map(|r| r.require_tools).unwrap_or(false);
+        // Projekt-Scope verschärft auch erzwungene Overrides (#33, konsistent zu #25/#28).
+        let local_only =
+            rule.map(|r| r.local_only).unwrap_or(false) || profile_rules.map(|p| p.local_only).unwrap_or(false);
+        let expected_output = match rule {
+            Some(r) => ((input_tokens as f64) * r.expected_output_ratio).ceil() as u64,
+            None => input_tokens,
+        };
+
+        if !state
+            .cfg
+            .provider_ready_for_model(&entry.provider, &entry.model)
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("erzwungenes Modell '{name}': Provider '{}' nicht bereit oder kein nutzbarer Key", entry.provider),
+            ));
+        }
+        // Geforderte Capabilities (Tools + Task-Regel + Request) auch bei Overrides erzwingen (#31).
+        let mut required_caps: Vec<&str> = Vec::new();
+        if need_tools {
+            required_caps.push("tools");
+        }
+        if let Some(r) = rule {
+            required_caps.extend(r.require_capabilities.iter().map(String::as_str));
+        }
+        required_caps.extend(req_capabilities.iter().map(String::as_str));
+        if let Some(missing) = required_caps.iter().find(|c| !entry.has_capability(c)) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("erzwungenes Modell '{name}' bietet die geforderte Capability '{missing}' nicht"),
+            ));
+        }
+        if local_only && !state.cfg.provider_is_local(&entry.provider) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("erzwungenes Modell '{name}' ist kein lokaler Provider — '{task_key}' (local_only) abgelehnt"),
+            ));
+        }
+        if let Some(p) = profile_rules {
+            if !p.allows_provider(&entry.provider) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("erzwungenes Modell '{name}': Provider '{}' durch Projekt-Scope gesperrt", entry.provider),
+                ));
+            }
+        }
+        let needed_context = input_tokens + expected_output;
+        if entry.context < needed_context {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("erzwungenes Modell '{name}': Kontextfenster {} < benötigt {needed_context}", entry.context),
+            ));
+        }
+        // Budget: auch ein erzwungenes Modell darf das Restbudget nicht sprengen
+        // (Prefix-Rabatt konsistent zur Routing-Schätzung).
+        let billed = state.cfg.prompt_cache_billed_fraction(&entry.provider);
+        let eff_input = cost::effective_input_tokens(input_tokens, cached_prefix_tokens, billed);
+        let est = entry.est_cost(eff_input, expected_output);
+        let remaining = router::remaining_budget(&state.cfg, &state.store);
+        if est > remaining {
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                format!("erzwungenes Modell '{name}': Schätzkosten {est:.5} USD über Restbudget {remaining:.5}"),
+            ));
+        }
+
         return Ok(Plan {
             tier: entry.tier,
             chain: vec![entry],
             degraded: false,
             pressure: router::current_pressure(&state.cfg, &state.store),
             expected_output,
+            forced: true,
+            project: project.clone(),
+            tools_expected: requires_tools,
         });
     }
 
@@ -212,6 +388,9 @@ fn build_plan(
         input_tokens,
         cached_prefix_tokens,
         session: session.as_deref(),
+        project: profile_rules,
+        req_capabilities,
+        profile,
     };
     match router::select(&state.cfg, &state.store, &state.sessions, &select_input) {
         Ok(s) => Ok(Plan {
@@ -220,6 +399,9 @@ fn build_plan(
             degraded: s.degraded,
             pressure: s.budget_pressure,
             expected_output: s.expected_output_tokens,
+            forced: false,
+            project: project.clone(),
+            tools_expected: requires_tools,
         }),
         Err(e) => Err(match e {
             SelectError::BudgetExceeded => (
@@ -323,6 +505,8 @@ async fn forward_with_retries(
                                     attempts,
                                     attempt_trail: serde_json::to_string(&trail).ok(),
                                     error: Some(last_err.clone()),
+                                    forced: plan.forced,
+                                    project: plan.project.clone(),
                                     ..Default::default()
                                 });
                                 return error_response(status, &last_err);
@@ -360,6 +544,8 @@ async fn forward_with_retries(
         attempt_trail: trail_json,
         status: StatusCode::BAD_GATEWAY.as_u16(),
         error: Some(last_err.clone()),
+        forced: plan.forced,
+        project: plan.project.clone(),
         ..Default::default()
     });
     error_response(
@@ -405,6 +591,9 @@ async fn handle_success(
                 tool: tool.to_string(),
                 session: session.clone(),
                 used_fallback,
+                forced: plan.forced,
+                project: plan.project.clone(),
+                tools_expected: plan.tools_expected,
                 input_tokens,
                 attempts,
                 trail_json,
@@ -447,6 +636,7 @@ async fn handle_success(
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str)
         .map(String::from);
+    let tool_call_present = response_has_tool_call(&payload);
     let real_cost = entry.est_cost(prompt_tokens, completion_tokens);
 
     // Erfolgreiche, nicht-streamende Antwort cachen.
@@ -478,6 +668,10 @@ async fn handle_success(
         attempts,
         attempt_trail: trail_json,
         stop_reason,
+        forced: plan.forced,
+        project: plan.project.clone(),
+        tools_expected: plan.tools_expected,
+        tool_call_present,
         ..Default::default()
     });
 
@@ -502,6 +696,9 @@ struct StreamCtx {
     tool: String,
     session: Option<String>,
     used_fallback: bool,
+    forced: bool,
+    project: Option<String>,
+    tools_expected: bool,
     input_tokens: u64,
     attempts: u32,
     trail_json: Option<String>,
@@ -554,6 +751,7 @@ fn finalize_stream(app: &AppState, acc: &[u8], ctx: &StreamCtx, stream_err: Opti
     let (pt, ct, finish) = parse_stream_usage(acc);
     let prompt_tokens = pt.unwrap_or(ctx.input_tokens);
     let completion_tokens = ct.unwrap_or(0);
+    let tool_call_present = finish.as_deref() == Some("tool_calls");
     let real_cost = ctx.entry.est_cost(prompt_tokens, completion_tokens);
 
     if stream_err.is_none() {
@@ -585,6 +783,10 @@ fn finalize_stream(app: &AppState, acc: &[u8], ctx: &StreamCtx, stream_err: Opti
         attempt_trail: ctx.trail_json.clone(),
         stop_reason: finish,
         error: stream_err,
+        forced: ctx.forced,
+        project: ctx.project.clone(),
+        tools_expected: ctx.tools_expected,
+        tool_call_present,
         ..Default::default()
     });
 }
@@ -632,7 +834,7 @@ fn cache_hit_stream_response(
     cached: String,
     started: Instant,
 ) -> Response {
-    let (pt, ct, _) = parse_stream_usage(cached.as_bytes());
+    let (pt, ct, finish) = parse_stream_usage(cached.as_bytes());
     let _ = state.store.insert(&RequestLog {
         tool: tool.into(),
         session: session.clone(),
@@ -646,6 +848,10 @@ fn cache_hit_stream_response(
         latency_ms: started.elapsed().as_millis() as u64,
         status: 200,
         cache_hit: true,
+        forced: plan.forced,
+        project: plan.project.clone(),
+        tools_expected: plan.tools_expected,
+        tool_call_present: finish.as_deref() == Some("tool_calls"),
         ..Default::default()
     });
 
@@ -686,6 +892,10 @@ fn cache_hit_response(
         latency_ms: started.elapsed().as_millis() as u64,
         status: 200,
         cache_hit: true,
+        forced: plan.forced,
+        project: plan.project.clone(),
+        tools_expected: plan.tools_expected,
+        tool_call_present: response_has_tool_call(&payload),
         ..Default::default()
     });
 
@@ -816,11 +1026,13 @@ fn log_failure(
     store: &Store,
     tool: &str,
     session: &Option<String>,
+    project: &Option<String>,
     task: &str,
     est: u64,
     _stage: &str,
     status: u16,
     err: &str,
+    forced: bool,
 ) {
     let _ = store.insert(&RequestLog {
         tool: tool.into(),
@@ -829,8 +1041,22 @@ fn log_failure(
         estimated_tokens: est,
         status,
         error: Some(err.into()),
+        forced,
+        project: project.clone(),
         ..Default::default()
     });
+}
+
+/// True, wenn die OpenAI-Antwort einen Tool-Call enthält (Qualitätssignal #29).
+fn response_has_tool_call(payload: &Value) -> bool {
+    if payload.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("tool_calls") {
+        return true;
+    }
+    payload
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -860,6 +1086,94 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Fixture für die forced-model-Validierung (#25): lokales + Cloud-Modelle mit
+    // unterschiedlichen Fähigkeiten/Kontextgrößen, alle Provider ohne Auth (ready).
+    const FORCE_YAML: &str = r#"
+server: { host: "127.0.0.1", port: 0 }
+providers:
+  local_p: { enabled: true, base_url: "http://localhost/v1", local: true }
+  cloud_p: { enabled: true, base_url: "https://example.com/v1" }
+models:
+  - { provider: local_p, model: "local-small", tier: 1, context: 8000, supports_tools: false, input_per_mtok: 0.0, output_per_mtok: 0.0 }
+  - { provider: cloud_p, model: "no-tools",     tier: 2, context: 8000, supports_tools: false, input_per_mtok: 0.1, output_per_mtok: 0.1 }
+  - { provider: cloud_p, model: "cloud-big",    tier: 5, context: 8000, supports_tools: true,  input_per_mtok: 1.0, output_per_mtok: 1.0 }
+  - { provider: cloud_p, model: "small-ctx",    tier: 1, context: 1000, supports_tools: true,  input_per_mtok: 0.1, output_per_mtok: 0.1 }
+classification:
+  simple_text:       { min_tier: 1, expected_output_ratio: 1.0 }
+  summarize:         { min_tier: 1 }
+  code_review:       { min_tier: 3 }
+  architecture:      { min_tier: 4 }
+  private_sensitive: { min_tier: 1, local_only: true, expected_output_ratio: 1.0 }
+projects:
+  secure: { local_only: true }
+"#;
+
+    fn force_state() -> AppState {
+        let cfg: Config = serde_yaml::from_str(FORCE_YAML).expect("fixture parses");
+        AppState {
+            cfg,
+            http: reqwest::Client::new(),
+            store: Store::open(":memory:").unwrap(),
+            sessions: SessionStore::default(),
+        }
+    }
+
+    #[test]
+    fn forced_cloud_model_rejected_for_private_sensitive() {
+        let st = force_state();
+        let err = build_plan(&st, &Some("cloud-big".into()), "private_sensitive", false, &[], 100, 0, &None, &None, Profile::Balanced)
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN, "got: {err:?}");
+    }
+
+    #[test]
+    fn forced_model_without_tool_support_rejected_when_tools_required() {
+        let st = force_state();
+        let err = build_plan(&st, &Some("no-tools".into()), "simple_text", true, &[], 100, 0, &None, &None, Profile::Balanced)
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST, "got: {err:?}");
+    }
+
+    #[test]
+    fn forced_model_with_insufficient_context_rejected() {
+        let st = force_state();
+        // 100k Input + 100k erwarteter Output passt nicht in 1k-Kontext.
+        let err = build_plan(&st, &Some("small-ctx".into()), "simple_text", false, &[], 100_000, 0, &None, &None, Profile::Balanced)
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST, "got: {err:?}");
+    }
+
+    #[test]
+    fn forced_valid_model_passes_constraints() {
+        let st = force_state();
+        let plan = build_plan(&st, &Some("cloud-big".into()), "simple_text", false, &[], 100, 0, &None, &None, Profile::Balanced)
+            .expect("gültiges erzwungenes Modell wird akzeptiert");
+        assert_eq!(plan.chain.len(), 1);
+        assert_eq!(plan.chain[0].model, "cloud-big");
+        assert_eq!(plan.project, None);
+    }
+
+    #[test]
+    fn project_local_only_routes_dynamic_selection_to_local() {
+        let st = force_state();
+        // Projekt 'secure' erzwingt local_only -> simple_text geht an local-small,
+        // und der Projektname landet im Plan (Logging-Metadaten, #33).
+        let plan = build_plan(&st, &None, "simple_text", false, &[], 100, 0, &None, &Some("secure".into()), Profile::Balanced)
+            .expect("local_only-Projekt hat einen gültigen lokalen Kandidaten");
+        assert!(st.cfg.provider_is_local(&plan.chain[0].provider));
+        assert_eq!(plan.chain[0].model, "local-small");
+        assert_eq!(plan.project.as_deref(), Some("secure"));
+    }
+
+    #[test]
+    fn forced_cloud_model_rejected_by_project_local_only() {
+        let st = force_state();
+        // Erzwungenes Cloud-Modell unter local_only-Projekt -> abgelehnt (#33/#25).
+        let err = build_plan(&st, &Some("cloud-big".into()), "simple_text", false, &[], 100, 0, &None, &Some("secure".into()), Profile::Balanced)
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN, "got: {err:?}");
+    }
 
     #[test]
     fn backoff_grows_and_is_capped() {
@@ -913,6 +1227,85 @@ mod tests {
         assert!(!constant_time_eq(b"secret-key", b"secret-keX"));
         assert!(!constant_time_eq(b"short", b"longer-key"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Stats-API (#18): Overview liefert DB-Kennzahlen + Budget-Felder, der
+    /// Requests-Feed listet die jüngsten Zeilen (neueste zuerst). Auth wird wie
+    /// beim Proxy über den llmux_key erzwungen.
+    #[tokio::test]
+    async fn stats_api_reports_overview_and_recent_requests_with_auth() {
+        let yaml = r#"
+server: { host: "127.0.0.1", port: 0 }
+auth: { llmux_key: "secret" }
+providers:
+  p: { enabled: true, base_url: "http://localhost/v1" }
+models:
+  - { provider: p, model: "m1", tier: 1, context: 8000, supports_tools: true, input_per_mtok: 0.0, output_per_mtok: 0.0 }
+classification:
+  simple_text:       { min_tier: 1 }
+  summarize:         { min_tier: 1 }
+  code_review:       { min_tier: 1 }
+  architecture:      { min_tier: 1 }
+  private_sensitive: { min_tier: 1 }
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let store = Store::open(":memory:").unwrap();
+        // Drei Logzeilen: Erfolg, Cache-Treffer, Provider-Fehler.
+        store.insert(&RequestLog { tool: "aider".into(), task_type: "simple_text".into(), model: "m1".into(), provider: "p".into(), tier: 1, prompt_tokens: 10, completion_tokens: 5, real_cost_usd: 0.01, latency_ms: 100, status: 200, ..Default::default() }).unwrap();
+        store.insert(&RequestLog { tool: "aider".into(), task_type: "simple_text".into(), model: "m1".into(), provider: "p".into(), tier: 1, latency_ms: 5, status: 200, cache_hit: true, ..Default::default() }).unwrap();
+        store.insert(&RequestLog { tool: "aider".into(), task_type: "simple_text".into(), status: 502, error: Some("boom".into()), ..Default::default() }).unwrap();
+
+        let state = Arc::new(AppState { cfg, http: reqwest::Client::new(), store, sessions: SessionStore::default() });
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // Ohne Key -> 401.
+        let unauth = client.get(format!("{base}/api/stats/overview")).send().await.unwrap();
+        assert_eq!(unauth.status(), 401);
+
+        // Mit Key -> Overview mit erwarteten Feldern.
+        let ov: Value = client
+            .get(format!("{base}/api/stats/overview"))
+            .bearer_auth("secret")
+            .send().await.unwrap()
+            .json().await.unwrap();
+        assert_eq!(ov["total_requests"], 3);
+        assert_eq!(ov["error_count"], 1);
+        assert!((ov["cache_hit_rate"].as_f64().unwrap() - 1.0 / 3.0).abs() < 1e-9);
+        assert!(ov.get("cost_today").is_some() && ov.get("budget_pressure").is_some());
+        // p95 über erfolgreiche Zeilen (100, 5) -> 100.
+        assert_eq!(ov["p95_latency_ms"], 100);
+
+        // Requests-Feed: limit greift, neueste zuerst, abgeleitetes result.
+        let rq: Value = client
+            .get(format!("{base}/api/stats/requests?limit=2"))
+            .bearer_auth("secret")
+            .send().await.unwrap()
+            .json().await.unwrap();
+        let arr = rq["requests"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // Neueste Zeile ist der Fehler -> result "rejected".
+        assert_eq!(arr[0]["status"], 502);
+        assert_eq!(arr[0]["result"], "rejected");
+        assert_eq!(arr[0]["error"], "boom");
+        // Die zweite ist der Cache-Treffer.
+        assert_eq!(arr[1]["result"], "cached");
+        assert_eq!(arr[1]["cache_hit"], true);
+    }
+
+    #[test]
+    fn detects_tool_call_in_response() {
+        // finish_reason = tool_calls.
+        assert!(response_has_tool_call(&json!({ "choices": [{ "finish_reason": "tool_calls", "message": {} }] })));
+        // tool_calls-Array im message-Objekt.
+        assert!(response_has_tool_call(&json!({ "choices": [{ "finish_reason": "stop", "message": { "tool_calls": [{ "id": "x" }] } }] })));
+        // Reine Textantwort -> kein Tool-Call.
+        assert!(!response_has_tool_call(&json!({ "choices": [{ "finish_reason": "stop", "message": { "content": "hi" } }] })));
     }
 
     #[test]
