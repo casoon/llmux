@@ -74,7 +74,7 @@ Single binary with modules (matching planned crates, separable later):
 
 | Module         | Responsibility                                          |
 |----------------|---------------------------------------------------------|
-| `api`          | HTTP layer, request pipeline                            |
+| `api`          | HTTP layer, request pipeline (ordered budget/cache/logging plugins with pre/post hooks) |
 | `classifier`   | Prompt → `task_type` + tool-use detection               |
 | `privacy`      | Sensitive content detection                             |
 | `router`       | Dynamic selector (tier/tools/budget) + sessions         |
