@@ -230,20 +230,8 @@ async fn chat_completions(
         return error_response(StatusCode::BAD_REQUEST, msg);
     }
 
-    // Per-Request-Kostendeckel (mit Prefix-Rabatt, konsistent zur Routing-Schätzung).
-    if let Some(mc) = max_cost {
-        let billed = state.cfg.prompt_cache_billed_fraction(&primary.provider);
-        let eff_input = cost::effective_input_tokens(input_tokens, cached_prefix_tokens, billed);
-        let est = primary.est_cost(eff_input, plan.expected_output);
-        if est > mc {
-            let msg = format!("Schätzkosten {est:.5} USD über max-cost {mc:.5}");
-            log_failure(&state.store, &tool, &session, &project, task_key, input_tokens, "max_cost", 402, &msg, force_model.is_some());
-            return error_response(StatusCode::PAYMENT_REQUIRED, &msg);
-        }
-    }
-
-    // Cache-Lookup (Exact-Match, opt-out per Header, History-Guard). Streaming-
-    // Antworten werden separat gecacht (eigener Key-Suffix, SSE-Replay).
+    // Cache-Voraussetzungen (opt-out per Header, History-Guard). Streaming-Antworten
+    // werden separat gecacht (eigener Key-Suffix, SSE-Replay).
     let cacheable = state.cfg.cache.enabled
         && !no_cache
         && cache::conversation_len(&body) <= state.cfg.cache.max_conversation_messages;
@@ -256,19 +244,38 @@ async fn chat_completions(
         }
     });
 
-    if let Some(key) = &cache_key {
-        if let Some(cached) = state.store.cache_lookup(key) {
-            return if is_stream {
-                cache_hit_stream_response(&state, &primary, &plan, task_key, &tool, &session, cached, started)
-            } else {
-                cache_hit_response(&state, &primary, &plan, task_key, &tool, &session, cached, started)
-            };
-        }
+    // Cross-cutting Pre-Hooks: Budget-Gate, dann Exact-Cache-Lookup (erster Halt gewinnt).
+    // `ctx.semantic` ist hier None — der Semantic-Schritt folgt unten, weil er erst nach
+    // einem Exact-Miss einen async Embedding-Fetch auslösen soll (Effizienz wie #14). (#15)
+    let pipeline = PluginPipeline::default();
+    let ctx = PluginCtx {
+        state: &state,
+        entry: &primary,
+        task_key,
+        tool: &tool,
+        session: &session,
+        project: &project,
+        tier: plan.tier,
+        pressure: plan.pressure,
+        forced: force_model.is_some(),
+        tools_expected: plan.tools_expected,
+        expected_output: plan.expected_output,
+        input_tokens,
+        cached_prefix_tokens,
+        max_cost,
+        cache_key: cache_key.as_ref(),
+        semantic: None,
+        is_stream,
+        started,
+    };
+    if let Some(resp) = pipeline.run_pre(&ctx) {
+        return resp;
     }
 
-    // Semantic-Cache (zweite Stufe, #14): nur non-stream, nach Exact-Miss. Embedding des
-    // User-Texts holen, ähnliche frühere Antwort desselben Modells suchen; sonst das
-    // Embedding für den späteren Store merken.
+    // Semantic-Cache (zweite Stufe, #14): erst nach bestandenem Budget-Gate und Exact-Miss
+    // das Embedding holen (einziger async-Schritt), damit Exact-Treffer und Budget-
+    // Ablehnungen keinen Embedding-Call kosten. Treffer schließt kurz; sonst wird das
+    // Embedding für den CachePlugin-`post`-Store gemerkt.
     let semantic = if cacheable && !is_stream {
         match state.cfg.cache.semantic.as_ref().filter(|s| s.enabled) {
             Some(scfg) => {
@@ -279,7 +286,7 @@ async fn chat_completions(
                         if let Some(cached) =
                             state.store.semantic_cache_lookup(&scope, &emb, scfg.threshold)
                         {
-                            return cache_hit_response(&state, &primary, &plan, task_key, &tool, &session, cached, started);
+                            return cache_hit_response(&ctx, cached);
                         }
                         Some(SemanticCache { scope, embedding: emb })
                     }
@@ -291,6 +298,9 @@ async fn chat_completions(
     } else {
         None
     };
+
+    // `ctx` wird ab hier nicht mehr verwendet; seine Borrows (u. a. cache_key) enden, sodass
+    // body/plan/cache_key/semantic ins Forwarding moven können.
 
     tracing::info!(
         task = task_key, tier = plan.tier, degraded = plan.degraded,
@@ -676,49 +686,44 @@ async fn handle_success(
     let tool_call_present = response_has_tool_call(&payload);
     let real_cost = entry.est_cost(prompt_tokens, completion_tokens);
 
-    // Erfolgreiche, nicht-streamende Antwort cachen (Exact + optional Semantic, #14).
-    if let Some(key) = &cache_key {
-        if let Ok(s) = serde_json::to_string(&payload) {
-            state
-                .store
-                .cache_store(key, &entry.model, &s, state.cfg.cache.ttl_seconds);
-            if let Some(sem) = &semantic {
-                state.store.semantic_cache_store(
-                    &sem.scope,
-                    &sem.embedding,
-                    &s,
-                    state.cfg.cache.ttl_seconds,
-                );
-            }
-        }
-    }
-
-    let _ = state.store.insert(&RequestLog {
-        tool: tool.into(),
-        session: session.clone(),
-        task_type: task_key.into(),
-        model: entry.model.clone(),
-        provider: entry.provider.clone(),
-        tier: plan.tier,
+    // Cache-Store + Logging laufen über die post-Hooks der Plugin-Pipeline (#15).
+    let out = PluginOutcome {
+        status: status.as_u16(),
         used_fallback,
         degraded: plan.degraded,
-        budget_pressure: plan.pressure,
         estimated_tokens: input_tokens,
         prompt_tokens,
         completion_tokens,
         estimated_cost_usd: entry.est_cost(input_tokens, plan.expected_output),
         real_cost_usd: real_cost,
-        latency_ms: started.elapsed().as_millis() as u64,
-        status: status.as_u16(),
         attempts,
         attempt_trail: trail_json,
         stop_reason,
-        forced: plan.forced,
-        project: plan.project.clone(),
-        tools_expected: plan.tools_expected,
+        error: None,
         tool_call_present,
-        ..Default::default()
-    });
+        body: serde_json::to_string(&payload).ok(),
+    };
+    let ctx = PluginCtx {
+        state,
+        entry,
+        task_key,
+        tool,
+        session,
+        project: &plan.project,
+        tier: plan.tier,
+        pressure: plan.pressure,
+        forced: plan.forced,
+        tools_expected: plan.tools_expected,
+        expected_output: plan.expected_output,
+        input_tokens,
+        cached_prefix_tokens: 0,
+        max_cost: None,
+        cache_key: cache_key.as_ref(),
+        semantic: semantic.as_ref(),
+        is_stream,
+        started,
+    };
+    PluginPipeline::default().run_post(&ctx, &out);
 
     tracing::info!(
         task = task_key, provider = %entry.provider, model = %entry.model,
@@ -799,41 +804,45 @@ fn finalize_stream(app: &AppState, acc: &[u8], ctx: &StreamCtx, stream_err: Opti
     let tool_call_present = finish.as_deref() == Some("tool_calls");
     let real_cost = ctx.entry.est_cost(prompt_tokens, completion_tokens);
 
-    if stream_err.is_none() {
-        if let Some(key) = &ctx.cache_key {
-            let body = String::from_utf8_lossy(acc).into_owned();
-            app.store
-                .cache_store(key, &ctx.entry.model, &body, app.cfg.cache.ttl_seconds);
-        }
-    }
-
-    let _ = app.store.insert(&RequestLog {
-        tool: ctx.tool.clone(),
-        session: ctx.session.clone(),
-        task_type: ctx.task_key.clone(),
-        model: ctx.entry.model.clone(),
-        provider: ctx.entry.provider.clone(),
-        tier: ctx.tier,
+    // Verzögertes Cache-Store + Logging laufen über dieselben post-Hooks wie der
+    // non-stream-Pfad (#15). Bei Stream-Fehler verhindert `error` den Cache-Store.
+    let out = PluginOutcome {
+        status: if stream_err.is_some() { StatusCode::BAD_GATEWAY.as_u16() } else { 200 },
         used_fallback: ctx.used_fallback,
         degraded: ctx.degraded,
-        budget_pressure: ctx.pressure,
         estimated_tokens: ctx.input_tokens,
         prompt_tokens,
         completion_tokens,
         estimated_cost_usd: ctx.entry.est_cost(ctx.input_tokens, ctx.expected_output),
         real_cost_usd: real_cost,
-        latency_ms: ctx.started.elapsed().as_millis() as u64,
-        status: if stream_err.is_some() { StatusCode::BAD_GATEWAY.as_u16() } else { 200 },
         attempts: ctx.attempts,
         attempt_trail: ctx.trail_json.clone(),
         stop_reason: finish,
         error: stream_err,
-        forced: ctx.forced,
-        project: ctx.project.clone(),
-        tools_expected: ctx.tools_expected,
         tool_call_present,
-        ..Default::default()
-    });
+        body: Some(String::from_utf8_lossy(acc).into_owned()),
+    };
+    let pctx = PluginCtx {
+        state: app,
+        entry: &ctx.entry,
+        task_key: &ctx.task_key,
+        tool: &ctx.tool,
+        session: &ctx.session,
+        project: &ctx.project,
+        tier: ctx.tier,
+        pressure: ctx.pressure,
+        forced: ctx.forced,
+        tools_expected: ctx.tools_expected,
+        expected_output: ctx.expected_output,
+        input_tokens: ctx.input_tokens,
+        cached_prefix_tokens: 0,
+        max_cost: None,
+        cache_key: ctx.cache_key.as_ref(),
+        semantic: None,
+        is_stream: true,
+        started: ctx.started,
+    };
+    PluginPipeline::default().run_post(&pctx, &out);
 }
 
 /// Extrahiert prompt-/completion_tokens und finish_reason aus einer SSE-Antwort.
@@ -868,39 +877,29 @@ fn parse_stream_usage(acc: &[u8]) -> (Option<u64>, Option<u64>, Option<String>) 
 }
 
 /// Cache-Treffer für eine Streaming-Anfrage: gespeicherte SSE als Stream zurückspielen.
-#[allow(clippy::too_many_arguments)]
-fn cache_hit_stream_response(
-    state: &AppState,
-    entry: &ModelEntry,
-    plan: &Plan,
-    task_key: &str,
-    tool: &str,
-    session: &Option<String>,
-    cached: String,
-    started: Instant,
-) -> Response {
+fn cache_hit_stream_response(ctx: &PluginCtx, cached: String) -> Response {
     let (pt, ct, finish) = parse_stream_usage(cached.as_bytes());
-    let _ = state.store.insert(&RequestLog {
-        tool: tool.into(),
-        session: session.clone(),
-        task_type: task_key.into(),
-        model: entry.model.clone(),
-        provider: entry.provider.clone(),
-        tier: plan.tier,
-        budget_pressure: plan.pressure,
+    let _ = ctx.state.store.insert(&RequestLog {
+        tool: ctx.tool.into(),
+        session: ctx.session.clone(),
+        task_type: ctx.task_key.into(),
+        model: ctx.entry.model.clone(),
+        provider: ctx.entry.provider.clone(),
+        tier: ctx.tier,
+        budget_pressure: ctx.pressure,
         prompt_tokens: pt.unwrap_or(0),
         completion_tokens: ct.unwrap_or(0),
-        latency_ms: started.elapsed().as_millis() as u64,
+        latency_ms: ctx.started.elapsed().as_millis() as u64,
         status: 200,
         cache_hit: true,
-        forced: plan.forced,
-        project: plan.project.clone(),
-        tools_expected: plan.tools_expected,
+        forced: ctx.forced,
+        project: ctx.project.clone(),
+        tools_expected: ctx.tools_expected,
         tool_call_present: finish.as_deref() == Some("tool_calls"),
         ..Default::default()
     });
 
-    tracing::info!(task = task_key, model = %entry.model, "cache hit (stream)");
+    tracing::info!(task = ctx.task_key, model = %ctx.entry.model, "cache hit (stream)");
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
@@ -909,48 +908,229 @@ fn cache_hit_stream_response(
         .unwrap()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cache_hit_response(
-    state: &AppState,
-    entry: &ModelEntry,
-    plan: &Plan,
-    task_key: &str,
-    tool: &str,
-    session: &Option<String>,
-    cached: String,
-    started: Instant,
-) -> Response {
+fn cache_hit_response(ctx: &PluginCtx, cached: String) -> Response {
     let payload: Value = serde_json::from_str(&cached).unwrap_or_else(|_| json!({}));
     let prompt_tokens = payload.pointer("/usage/prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
     let completion_tokens = payload.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0);
 
-    let _ = state.store.insert(&RequestLog {
-        tool: tool.into(),
-        session: session.clone(),
-        task_type: task_key.into(),
-        model: entry.model.clone(),
-        provider: entry.provider.clone(),
-        tier: plan.tier,
-        budget_pressure: plan.pressure,
+    let _ = ctx.state.store.insert(&RequestLog {
+        tool: ctx.tool.into(),
+        session: ctx.session.clone(),
+        task_type: ctx.task_key.into(),
+        model: ctx.entry.model.clone(),
+        provider: ctx.entry.provider.clone(),
+        tier: ctx.tier,
+        budget_pressure: ctx.pressure,
         prompt_tokens,
         completion_tokens,
-        latency_ms: started.elapsed().as_millis() as u64,
+        latency_ms: ctx.started.elapsed().as_millis() as u64,
         status: 200,
         cache_hit: true,
-        forced: plan.forced,
-        project: plan.project.clone(),
-        tools_expected: plan.tools_expected,
+        forced: ctx.forced,
+        project: ctx.project.clone(),
+        tools_expected: ctx.tools_expected,
         tool_call_present: response_has_tool_call(&payload),
         ..Default::default()
     });
 
-    tracing::info!(task = task_key, model = %entry.model, "cache hit");
+    tracing::info!(task = ctx.task_key, model = %ctx.entry.model, "cache hit");
     (
         StatusCode::OK,
         [("x-llmux-cache", "hit")],
         Json(payload),
     )
         .into_response()
+}
+
+// ===========================================================================
+// Plugin-Pipeline für Cross-cutting Concerns (#15)
+//
+// Die request-übergreifenden Belange Budget, Cache und Logging sind als geordnete
+// Plugin-Liste ausgedrückt. Jedes Plugin hat `pre()` (vor dem Forwarding; darf per
+// `Some(Response)` kurzschließen — Cache-Treffer, Budget-Ablehnung) und `post()`
+// (nach Vorliegen des Ergebnisses; läuft in umgekehrter Reihenfolge). Ein neues
+// Plugin wird durch Eintrag in `PluginPipeline::default` eingehängt, ohne den
+// Kern-Request-Pfad zu ändern.
+//
+// Privacy ist bewusst KEIN Pipeline-Plugin: der Privacy-Scan ist ein Routing-Input
+// (erzwingt `private_sensitive`/`local_only` bei der Klassifikation, schließt nie
+// kurz und verarbeitet kein Ergebnis nach) und bleibt im Klassifikations-Schritt.
+// ===========================================================================
+
+/// Request-invarianter Kontext, den alle Plugins teilen. `entry` ist phasenabhängig:
+/// in `pre` das geplante Primärmodell, in `post` das Modell, das geantwortet hat.
+struct PluginCtx<'a> {
+    state: &'a AppState,
+    entry: &'a ModelEntry,
+    task_key: &'a str,
+    tool: &'a str,
+    session: &'a Option<String>,
+    project: &'a Option<String>,
+    tier: u8,
+    pressure: f64,
+    forced: bool,
+    tools_expected: bool,
+    expected_output: u64,
+    input_tokens: u64,
+    cached_prefix_tokens: u64,
+    max_cost: Option<f64>,
+    cache_key: Option<&'a String>,
+    semantic: Option<&'a SemanticCache>,
+    is_stream: bool,
+    started: Instant,
+}
+
+/// Terminal-Ergebnis eines erfolgreich weitergeleiteten Requests, das die `post`-Hooks
+/// (Cache-Store, Logging) verarbeiten. Cache-Treffer und Fehler-Gates loggen selbst in
+/// `pre` und durchlaufen `run_post` nicht.
+struct PluginOutcome {
+    status: u16,
+    used_fallback: bool,
+    degraded: bool,
+    estimated_tokens: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    estimated_cost_usd: f64,
+    real_cost_usd: f64,
+    attempts: u32,
+    attempt_trail: Option<String>,
+    stop_reason: Option<String>,
+    error: Option<String>,
+    tool_call_present: bool,
+    /// Serialisierte Antwort für den Cache-Store. Gespeichert wird nur, wenn zusätzlich
+    /// `error` None ist und ein `cache_key` vorliegt (siehe `CachePlugin::post`); `None`
+    /// hier unterdrückt den Store ebenfalls.
+    body: Option<String>,
+}
+
+trait Plugin: Send + Sync {
+    fn pre(&self, _ctx: &PluginCtx) -> Option<Response> {
+        None
+    }
+    fn post(&self, _ctx: &PluginCtx, _out: &PluginOutcome) {}
+}
+
+/// Geordnete Plugin-Kette. `run_pre` läuft vorwärts (erster Halt gewinnt), `run_post`
+/// rückwärts.
+struct PluginPipeline {
+    plugins: Vec<Box<dyn Plugin>>,
+}
+
+impl Default for PluginPipeline {
+    fn default() -> Self {
+        Self {
+            plugins: vec![
+                Box::new(BudgetPlugin),
+                Box::new(CachePlugin),
+                Box::new(LoggingPlugin),
+            ],
+        }
+    }
+}
+
+impl PluginPipeline {
+    fn run_pre(&self, ctx: &PluginCtx) -> Option<Response> {
+        for p in &self.plugins {
+            if let Some(resp) = p.pre(ctx) {
+                return Some(resp);
+            }
+        }
+        None
+    }
+
+    fn run_post(&self, ctx: &PluginCtx, out: &PluginOutcome) {
+        for p in self.plugins.iter().rev() {
+            p.post(ctx, out);
+        }
+    }
+}
+
+/// Budget: lehnt den Request ab (402), wenn die geschätzten Kosten den per-Request-Cap
+/// (`x-llmux-max-cost`) übersteigen. Konsistent zur Routing-Schätzung mit Prefix-Rabatt.
+struct BudgetPlugin;
+impl Plugin for BudgetPlugin {
+    fn pre(&self, ctx: &PluginCtx) -> Option<Response> {
+        let mc = ctx.max_cost?;
+        let billed = ctx.state.cfg.prompt_cache_billed_fraction(&ctx.entry.provider);
+        let eff_input = cost::effective_input_tokens(ctx.input_tokens, ctx.cached_prefix_tokens, billed);
+        let est = ctx.entry.est_cost(eff_input, ctx.expected_output);
+        if est > mc {
+            let msg = format!("Schätzkosten {est:.5} USD über max-cost {mc:.5}");
+            log_failure(
+                &ctx.state.store, ctx.tool, ctx.session, ctx.project, ctx.task_key,
+                ctx.input_tokens, "max_cost", 402, &msg, ctx.forced,
+            );
+            return Some(error_response(StatusCode::PAYMENT_REQUIRED, &msg));
+        }
+        None
+    }
+}
+
+/// Cache: Exact-Match-Lookup als `pre`-Kurzschluss; Ablage der frischen Antwort
+/// (Exact-Cache und optional Semantic-Cache) in `post`. Der Semantic-Lookup selbst läuft
+/// inline im Handler, da er einen async Embedding-Fetch erfordert und erst nach einem
+/// Exact-Miss greifen soll.
+struct CachePlugin;
+impl Plugin for CachePlugin {
+    fn pre(&self, ctx: &PluginCtx) -> Option<Response> {
+        let key = ctx.cache_key?;
+        ctx.state.store.cache_lookup(key).map(|cached| {
+            if ctx.is_stream {
+                cache_hit_stream_response(ctx, cached)
+            } else {
+                cache_hit_response(ctx, cached)
+            }
+        })
+    }
+
+    fn post(&self, ctx: &PluginCtx, out: &PluginOutcome) {
+        if out.error.is_some() {
+            return;
+        }
+        let Some(key) = ctx.cache_key else { return };
+        let Some(body) = out.body.as_deref() else { return };
+        let ttl = ctx.state.cfg.cache.ttl_seconds;
+        ctx.state.store.cache_store(key, &ctx.entry.model, body, ttl);
+        if let Some(sem) = ctx.semantic {
+            ctx.state
+                .store
+                .semantic_cache_store(&sem.scope, &sem.embedding, body, ttl);
+        }
+    }
+}
+
+/// Logging: schreibt die RequestLog-Zeile aus invariantem Kontext + Terminal-Ergebnis.
+struct LoggingPlugin;
+impl Plugin for LoggingPlugin {
+    fn post(&self, ctx: &PluginCtx, out: &PluginOutcome) {
+        let _ = ctx.state.store.insert(&RequestLog {
+            tool: ctx.tool.into(),
+            session: ctx.session.clone(),
+            task_type: ctx.task_key.into(),
+            model: ctx.entry.model.clone(),
+            provider: ctx.entry.provider.clone(),
+            tier: ctx.tier,
+            used_fallback: out.used_fallback,
+            degraded: out.degraded,
+            budget_pressure: ctx.pressure,
+            estimated_tokens: out.estimated_tokens,
+            prompt_tokens: out.prompt_tokens,
+            completion_tokens: out.completion_tokens,
+            estimated_cost_usd: out.estimated_cost_usd,
+            real_cost_usd: out.real_cost_usd,
+            latency_ms: ctx.started.elapsed().as_millis() as u64,
+            status: out.status,
+            attempts: out.attempts,
+            attempt_trail: out.attempt_trail.clone(),
+            stop_reason: out.stop_reason.clone(),
+            error: out.error.clone(),
+            forced: ctx.forced,
+            project: ctx.project.clone(),
+            tools_expected: ctx.tools_expected,
+            tool_call_present: out.tool_call_present,
+            ..Default::default()
+        });
+    }
 }
 
 fn classify_status(status: StatusCode) -> Outcome {
@@ -1162,6 +1342,83 @@ projects:
             store: Store::open(":memory:").unwrap(),
             sessions: SessionStore::default(),
         }
+    }
+
+    // #15: Die Pipeline ist eine geordnete Plugin-Liste — ein zusätzliches Plugin wird
+    // allein durch Eintrag in die Liste eingehängt. `pre` läuft vorwärts (der erste Halt
+    // stoppt die Kette), `post` rückwärts.
+    #[test]
+    fn plugin_pipeline_runs_pre_forward_post_reverse_and_halts() {
+        use std::sync::Mutex as StdMutex;
+
+        struct Rec {
+            tag: char,
+            halt: bool,
+            log: Arc<StdMutex<Vec<String>>>,
+        }
+        impl Plugin for Rec {
+            fn pre(&self, _ctx: &PluginCtx) -> Option<Response> {
+                self.log.lock().unwrap().push(format!("pre:{}", self.tag));
+                self.halt.then(|| StatusCode::OK.into_response())
+            }
+            fn post(&self, _ctx: &PluginCtx, _out: &PluginOutcome) {
+                self.log.lock().unwrap().push(format!("post:{}", self.tag));
+            }
+        }
+
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let mk = |tag, halt| Box::new(Rec { tag, halt, log: log.clone() }) as Box<dyn Plugin>;
+        let pipeline = PluginPipeline {
+            plugins: vec![mk('a', false), mk('b', true), mk('c', false)],
+        };
+
+        let st = force_state();
+        let entry = st.cfg.models[0].clone();
+        let none: Option<String> = None;
+        let ctx = PluginCtx {
+            state: &st,
+            entry: &entry,
+            task_key: "simple_text",
+            tool: "t",
+            session: &none,
+            project: &none,
+            tier: 1,
+            pressure: 0.0,
+            forced: false,
+            tools_expected: false,
+            expected_output: 0,
+            input_tokens: 0,
+            cached_prefix_tokens: 0,
+            max_cost: None,
+            cache_key: None,
+            semantic: None,
+            is_stream: false,
+            started: Instant::now(),
+        };
+
+        // pre stoppt bei 'b' (Halt) — 'c'.pre läuft nicht mehr.
+        assert!(pipeline.run_pre(&ctx).is_some());
+
+        let out = PluginOutcome {
+            status: 200,
+            used_fallback: false,
+            degraded: false,
+            estimated_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            estimated_cost_usd: 0.0,
+            real_cost_usd: 0.0,
+            attempts: 0,
+            attempt_trail: None,
+            stop_reason: None,
+            error: None,
+            tool_call_present: false,
+            body: None,
+        };
+        pipeline.run_post(&ctx, &out);
+
+        let seq = log.lock().unwrap().clone();
+        assert_eq!(seq, vec!["pre:a", "pre:b", "post:c", "post:b", "post:a"]);
     }
 
     #[test]
