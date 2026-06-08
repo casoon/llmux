@@ -45,12 +45,44 @@ pub struct ClassifierConfig {
     /// den `task_type` bestimmt. System-/Assistant-/Tool-Rollen bleiben außen vor,
     /// damit der große statische Prefix von Agent-Clients die Wahl nicht verzerrt (#22).
     pub user_messages: usize,
+    /// Optionaler LLM-Klassifikator (#13): fragt ein kleines lokales Modell nach dem
+    /// `task_type`. Bei Fehler/Timeout greift nahtlos die regelbasierte Klassifikation.
+    /// Fehlt der Block oder ist `enabled: false`, bleibt alles regelbasiert.
+    #[serde(default)]
+    pub llm: Option<LlmClassifierConfig>,
 }
 
 impl Default for ClassifierConfig {
     fn default() -> Self {
-        Self { user_messages: 1 }
+        Self {
+            user_messages: 1,
+            llm: None,
+        }
     }
+}
+
+/// Konfiguration des optionalen LLM-Klassifikators (#13). Selbstständig (eigener
+/// Endpoint), damit die Klassifikation nicht an den Routing-Modellkatalog gekoppelt
+/// ist — typischerweise zeigt sie auf ein kleines lokales Modell (Ollama o. Ä.).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmClassifierConfig {
+    /// Schalter. `false` = LLM-Pfad aus, nur regelbasiert.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OpenAI-kompatibler Basis-URL (z. B. `http://localhost:11434/v1`).
+    pub base_url: String,
+    /// Modellname am Endpoint (z. B. `qwen2.5:0.5b`).
+    pub model: String,
+    /// Env-Variable mit dem API-Key, falls der Endpoint Auth verlangt (lokal meist nicht).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Timeout pro Klassifikationsaufruf; danach Fallback auf Regeln.
+    #[serde(default = "default_classify_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_classify_timeout_ms() -> u64 {
+    1500
 }
 
 /// Routing-Profil: priorisiert bei sonst gleichen harten Filtern Kosten oder
@@ -119,6 +151,43 @@ pub struct CacheConfig {
     pub max_entries: Option<usize>,
     /// Intervall des Hintergrund-Sweeps (abgelaufene Einträge + Zeilenlimit).
     pub eviction_interval_seconds: u64,
+    /// Optionaler Semantic-Cache als zweite Stufe (#14): trifft nach einem Exact-Miss
+    /// auch semantisch ähnliche, anders formulierte Requests. Fehlt der Block oder ist
+    /// `enabled: false`, bleibt es beim reinen Exact-Match-Cache.
+    #[serde(default)]
+    pub semantic: Option<SemanticCacheConfig>,
+}
+
+/// Konfiguration des Semantic-Cache (#14). Selbstständig (eigener Embedding-Endpoint),
+/// typischerweise ein kleines lokales Embedding-Modell (Ollama o. Ä.). Der Vektor-Store
+/// liegt in SQLite; die Ähnlichkeitssuche ist lokaler Brute-Force-Cosine.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticCacheConfig {
+    /// Schalter. `false` = nur Exact-Match-Cache.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OpenAI-kompatibler Basis-URL des Embedding-Endpoints (`/embeddings`).
+    pub base_url: String,
+    /// Embedding-Modell (z. B. `nomic-embed-text`).
+    pub model: String,
+    /// Env-Variable mit dem API-Key, falls der Endpoint Auth verlangt.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Timeout pro Embedding-Aufruf; danach wird der Semantic-Schritt übersprungen.
+    #[serde(default = "default_semantic_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Cosine-Ähnlichkeitsschwelle (0.0–1.0): ab hier gilt ein gespeicherter Eintrag
+    /// als Treffer. Höher = strenger.
+    #[serde(default = "default_semantic_threshold")]
+    pub threshold: f32,
+}
+
+fn default_semantic_timeout_ms() -> u64 {
+    1500
+}
+
+fn default_semantic_threshold() -> f32 {
+    0.85
 }
 
 impl Default for CacheConfig {
@@ -129,6 +198,7 @@ impl Default for CacheConfig {
             max_conversation_messages: 3,
             max_entries: None,
             eviction_interval_seconds: 300,
+            semantic: None,
         }
     }
 }

@@ -1,7 +1,9 @@
 //! Regelbasierte Analyse des Requests: task_type + agentische Merkmale (Tool-Use).
 //! Später ersetzbar durch ein kleines lokales Klassifikationsmodell.
 
-use serde_json::Value;
+use crate::config::LlmClassifierConfig;
+use serde_json::{json, Value};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskType {
@@ -30,6 +32,19 @@ impl TaskType {
             TaskType::CodeReview => "code_review",
             TaskType::Summarize => "summarize",
             TaskType::SimpleText => "simple_text",
+        }
+    }
+
+    /// Inverse zu [`TaskType::as_key`] für die regelbasiert erzeugbaren Typen.
+    /// `private_sensitive` ist bewusst ausgeschlossen — der wird allein über den
+    /// Privacy-Scan gesetzt, nicht vom (LLM-)Klassifikator.
+    fn from_key(key: &str) -> Option<TaskType> {
+        match key {
+            "architecture" => Some(TaskType::Architecture),
+            "code_review" => Some(TaskType::CodeReview),
+            "summarize" => Some(TaskType::Summarize),
+            "simple_text" => Some(TaskType::SimpleText),
+            _ => None,
         }
     }
 }
@@ -74,6 +89,86 @@ pub fn classify(text: &str) -> TaskType {
     }
 
     TaskType::SimpleText
+}
+
+/// System-Prompt des optionalen LLM-Klassifikators (#13): zwingt das Modell auf genau
+/// einen der regelbasierten task_type-Schlüssel.
+const CLASSIFY_SYSTEM_PROMPT: &str = "You are a request classifier for a code-assistant \
+router. Read the user's request and reply with exactly one of these labels and nothing \
+else: architecture, code_review, summarize, simple_text. Use 'architecture' for system \
+design, data modeling, scalability or security trade-offs; 'code_review' for writing, \
+fixing, refactoring, reviewing or testing code; 'summarize' for summarizing, explaining \
+or translating; 'simple_text' for anything else. Answer with the label only.";
+
+/// Klassifiziert `text`. Ist der LLM-Klassifikator konfiguriert und aktiv, entscheidet
+/// das Modell; bei Fehler, Timeout oder unklarer Antwort übernimmt nahtlos die
+/// regelbasierte [`classify`]. (#13)
+pub async fn classify_with_llm(
+    http: &reqwest::Client,
+    llm: Option<&LlmClassifierConfig>,
+    text: &str,
+) -> TaskType {
+    if let Some(cfg) = llm {
+        if cfg.enabled {
+            if let Some(t) = classify_llm(http, cfg, text).await {
+                return t;
+            }
+        }
+    }
+    classify(text)
+}
+
+/// Fragt das konfigurierte Modell nach dem task_type. `None` bei jedem Fehler
+/// (Netzwerk, Timeout, Nicht-2xx, unparsbare oder unbekannte Antwort) — der Aufrufer
+/// fällt dann auf die Regeln zurück.
+async fn classify_llm(
+    http: &reqwest::Client,
+    cfg: &LlmClassifierConfig,
+    text: &str,
+) -> Option<TaskType> {
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let payload = json!({
+        "model": cfg.model,
+        "temperature": 0,
+        "max_tokens": 16,
+        "messages": [
+            { "role": "system", "content": CLASSIFY_SYSTEM_PROMPT },
+            { "role": "user", "content": text },
+        ],
+    });
+
+    let mut req = http
+        .post(&url)
+        .timeout(Duration::from_millis(cfg.timeout_ms))
+        .json(&payload);
+    if let Some(env) = &cfg.api_key_env {
+        if let Ok(key) = std::env::var(env) {
+            req = req.bearer_auth(key);
+        }
+    }
+
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: Value = resp.json().await.ok()?;
+    let answer = body
+        .get("choices")?
+        .get(0)?
+        .get("message")?
+        .get("content")?
+        .as_str()?;
+    parse_task_type(answer)
+}
+
+/// Extrahiert einen task_type aus der (ggf. geschwätzigen) Modellantwort: erster
+/// bekannter Schlüssel, der als Teilstring vorkommt (case-insensitive).
+fn parse_task_type(answer: &str) -> Option<TaskType> {
+    let a = answer.to_lowercase();
+    ["architecture", "code_review", "summarize", "simple_text"]
+        .into_iter()
+        .find(|key| a.contains(key))
+        .and_then(TaskType::from_key)
 }
 
 /// Erkennt agentische Tool-Use-Requests: Tool-/Function-Definitionen, erzwungene
@@ -158,7 +253,40 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{http::StatusCode, routing::post, Json, Router};
     use serde_json::json;
+
+    /// Startet einen OpenAI-kompatiblen Mock, der auf `/chat/completions` mit `responder`
+    /// antwortet, und liefert die Basis-URL. (Memory: echte lokale Modelle zu schwer.)
+    async fn spawn_mock<F, R>(responder: F) -> String
+    where
+        F: Fn() -> R + Clone + Send + Sync + 'static,
+        R: IntoResponse,
+    {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let r = responder.clone();
+                async move { r() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn llm_cfg(base_url: String, enabled: bool) -> LlmClassifierConfig {
+        LlmClassifierConfig {
+            enabled,
+            base_url,
+            model: "test".into(),
+            api_key_env: None,
+            timeout_ms: 2000,
+        }
+    }
+
+    use axum::response::IntoResponse;
 
     #[test]
     fn classifies_each_task_type() {
@@ -217,5 +345,55 @@ mod tests {
     fn plain_request_has_no_extra_capabilities() {
         let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
         assert!(request_capabilities(&body).is_empty());
+    }
+
+    // #13: parst auch eine geschwätzige Modellantwort robust.
+    #[test]
+    fn parses_model_answer() {
+        assert_eq!(parse_task_type("code_review"), Some(TaskType::CodeReview));
+        assert_eq!(parse_task_type("Label: ARCHITECTURE"), Some(TaskType::Architecture));
+        assert_eq!(parse_task_type("simple_text\n"), Some(TaskType::SimpleText));
+        assert_eq!(parse_task_type("völliger Unsinn"), None);
+    }
+
+    // #13: bei aktivem LLM bestimmt das Modell den task_type — hier überstimmt es die
+    // Regeln, die für denselben Text CodeReview ergäben.
+    #[tokio::test]
+    async fn llm_decides_task_type_when_enabled() {
+        let base = spawn_mock(|| {
+            Json(json!({ "choices": [{ "message": { "content": "architecture" } }] }))
+        })
+        .await;
+        let got = classify_with_llm(
+            &reqwest::Client::new(),
+            Some(&llm_cfg(base, true)),
+            "fix the bug in this function",
+        )
+        .await;
+        assert_eq!(got, TaskType::Architecture);
+        // Gegenprobe: regelbasiert ergäbe CodeReview.
+        assert_eq!(classify("fix the bug in this function"), TaskType::CodeReview);
+    }
+
+    // #13: bei einem Fehler des LLM-Endpoints greift nahtlos die Regelklassifikation.
+    #[tokio::test]
+    async fn falls_back_to_rules_on_llm_error() {
+        let base = spawn_mock(|| StatusCode::INTERNAL_SERVER_ERROR).await;
+        let got = classify_with_llm(
+            &reqwest::Client::new(),
+            Some(&llm_cfg(base, true)),
+            "fix the bug in this function",
+        )
+        .await;
+        assert_eq!(got, TaskType::CodeReview);
+    }
+
+    // #13: deaktivierter LLM-Klassifikator ruft den Endpoint gar nicht erst auf.
+    #[tokio::test]
+    async fn disabled_llm_uses_rules() {
+        // Nicht erreichbare URL — würde der Code sie kontaktieren, schlüge der Test fehl.
+        let cfg = llm_cfg("http://127.0.0.1:1".into(), false);
+        let got = classify_with_llm(&reqwest::Client::new(), Some(&cfg), "fix the bug").await;
+        assert_eq!(got, TaskType::CodeReview);
     }
 }

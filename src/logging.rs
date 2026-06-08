@@ -89,6 +89,16 @@ impl Store {
                 expires_ts TEXT NOT NULL,
                 hits       INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS semantic_cache (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope      TEXT NOT NULL,
+                embedding  BLOB NOT NULL,
+                response   TEXT NOT NULL,
+                created_ts TEXT NOT NULL,
+                expires_ts TEXT NOT NULL,
+                hits       INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_semantic_scope ON semantic_cache(scope);
             "#,
         )?;
 
@@ -193,12 +203,65 @@ impl Store {
         );
     }
 
-    /// Löscht abgelaufene Cache-Einträge. Gibt die Anzahl entfernter Zeilen zurück.
+    /// Semantic-Cache (#14): legt ein Embedding + Antwort unter einem Modell-`scope` ab.
+    pub fn semantic_cache_store(&self, scope: &str, embedding: &[f32], response: &str, ttl_seconds: u64) {
+        let now = chrono::Utc::now();
+        let created = now.to_rfc3339();
+        let expires = (now + chrono::Duration::seconds(ttl_seconds as i64)).to_rfc3339();
+        let blob = crate::cache::embedding_to_bytes(embedding);
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            r#"INSERT INTO semantic_cache (scope, embedding, response, created_ts, expires_ts, hits)
+               VALUES (?1, ?2, ?3, ?4, ?5, 0)"#,
+            rusqlite::params![scope, blob, response, created, expires],
+        );
+    }
+
+    /// Semantic-Cache-Lookup (#14): durchsucht die nicht abgelaufenen Einträge des
+    /// `scope` per Brute-Force-Cosine und liefert die Antwort des ähnlichsten Eintrags,
+    /// sofern dessen Ähnlichkeit `>= threshold` ist. Erhöht dessen Trefferzähler.
+    pub fn semantic_cache_lookup(&self, scope: &str, query: &[f32], threshold: f32) -> Option<String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, embedding, response FROM semantic_cache WHERE scope = ?1 AND expires_ts > ?2")
+            .ok()?;
+        let rows = stmt
+            .query_map(rusqlite::params![scope, now], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, String>(2)?))
+            })
+            .ok()?;
+
+        let mut best: Option<(i64, f32, String)> = None;
+        for row in rows.flatten() {
+            let (id, blob, response) = row;
+            let emb = crate::cache::embedding_from_bytes(&blob);
+            let sim = crate::cache::cosine_similarity(query, &emb);
+            if best.as_ref().map(|b| sim > b.1).unwrap_or(true) {
+                best = Some((id, sim, response));
+            }
+        }
+
+        match best {
+            Some((id, sim, response)) if sim >= threshold => {
+                let _ = conn.execute("UPDATE semantic_cache SET hits = hits + 1 WHERE id = ?1", [id]);
+                Some(response)
+            }
+            _ => None,
+        }
+    }
+
+    /// Löscht abgelaufene Cache-Einträge (Exact + Semantic). Gibt die Anzahl entfernter Zeilen zurück.
     pub fn evict_expired_cache(&self) -> usize {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM cache WHERE expires_ts <= ?1", [now])
-            .unwrap_or(0)
+        let exact = conn
+            .execute("DELETE FROM cache WHERE expires_ts <= ?1", [now.clone()])
+            .unwrap_or(0);
+        let semantic = conn
+            .execute("DELETE FROM semantic_cache WHERE expires_ts <= ?1", [now])
+            .unwrap_or(0);
+        exact + semantic
     }
 
     /// Hält die Cache-Tabelle unter `max` Zeilen, indem die ältesten (nach
@@ -738,6 +801,56 @@ mod tests {
     fn cache_count(store: &Store) -> i64 {
         let conn = store.conn.lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM cache", [], |r| r.get(0)).unwrap()
+    }
+
+    // #14: Ein semantisch ähnliches (anders gewichtetes) Query-Embedding trifft über
+    // der Schwelle; ein unähnliches (orthogonales) verfehlt sie.
+    #[test]
+    fn semantic_cache_hits_above_threshold_misses_below() {
+        let s = store();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        // Eintrag direkt ablegen (mit künftigem Ablauf).
+        let blob = crate::cache::embedding_to_bytes(&[1.0, 0.0, 0.0]);
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                r#"INSERT INTO semantic_cache (scope, embedding, response, created_ts, expires_ts, hits)
+                   VALUES ('p/m', ?1, '{"cached":true}', ?2, ?2, 0)"#,
+                rusqlite::params![blob, future],
+            )
+            .unwrap();
+        }
+        // Fast gleiche Richtung -> hohe Cosine -> Treffer.
+        assert_eq!(
+            s.semantic_cache_lookup("p/m", &[0.99, 0.1, 0.0], 0.85).as_deref(),
+            Some(r#"{"cached":true}"#)
+        );
+        // Orthogonal -> Cosine 0 -> Miss.
+        assert!(s.semantic_cache_lookup("p/m", &[0.0, 1.0, 0.0], 0.85).is_none());
+        // Anderer Scope -> Miss.
+        assert!(s.semantic_cache_lookup("p/other", &[1.0, 0.0, 0.0], 0.85).is_none());
+    }
+
+    // #14: store -> lookup über die öffentliche API, inklusive TTL-Eviction.
+    #[test]
+    fn semantic_cache_store_and_evict() {
+        let s = store();
+        s.semantic_cache_store("p/m", &[0.0, 1.0], r#"{"a":1}"#, 3600);
+        assert_eq!(
+            s.semantic_cache_lookup("p/m", &[0.0, 1.0], 0.9).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        // Abgelaufenen Eintrag einfügen und Eviction prüfen.
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                r#"INSERT INTO semantic_cache (scope, embedding, response, created_ts, expires_ts, hits)
+                   VALUES ('p/m', ?1, '{}', '2000-01-01T00:00:00+00:00', '2000-01-01T00:00:00+00:00', 0)"#,
+                rusqlite::params![crate::cache::embedding_to_bytes(&[1.0, 0.0])],
+            )
+            .unwrap();
+        }
+        assert_eq!(s.evict_expired_cache(), 1); // nur die abgelaufene semantische Zeile
     }
 
     #[test]
