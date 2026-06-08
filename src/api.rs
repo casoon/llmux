@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -72,6 +72,67 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/stats/latency", get(stats_latency))
         .route("/api/stats/budget-series", get(stats_budget_series))
         .with_state(state)
+        // Fallback: das eingebettete Dashboard. Registriert NACH /healthz, /v1/* und
+        // /api/* — diese behalten Vorrang, nur unbelegte Pfade landen hier. (#20)
+        .fallback(serve_dashboard)
+}
+
+/// Statisch eingebettete Dashboard-Build-Ausgabe (`dist/dashboard`), zur Compile-Zeit
+/// ins Binary aufgenommen — kein Node zur Laufzeit nötig (#20).
+#[derive(rust_embed::RustEmbed)]
+#[folder = "dist/dashboard"]
+struct DashboardAssets;
+
+const DASHBOARD_NOT_BUILT: &str = "<!doctype html><meta charset=utf-8><title>llmux</title>\
+<body style=\"font-family:system-ui;background:#111;color:#ddd;padding:2rem\">\
+<h1>llmux dashboard not built</h1><p>Run <code>npm install &amp;&amp; npm run build</code> \
+before building the binary to embed the dashboard. The proxy and Stats API are unaffected.</p>";
+
+/// Content-Type aus der Dateiendung (die Astro-Ausgabe ist html/css/js plus ggf. Assets).
+fn asset_mime(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("json") | Some("map") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        _ => "application/octet-stream",
+    }
+}
+
+fn dashboard_index() -> Response {
+    match DashboardAssets::get("index.html") {
+        Some(f) => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            f.data.into_owned(),
+        )
+            .into_response(),
+        None => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            DASHBOARD_NOT_BUILT,
+        )
+            .into_response(),
+    }
+}
+
+/// Liefert das eingebettete Dashboard: `/` und seitenartige Pfade → `index.html`,
+/// vorhandene Asset-Dateien mit passendem MIME, fehlende Asset-Dateien → 404.
+async fn serve_dashboard(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    if path.is_empty() {
+        return dashboard_index();
+    }
+    match DashboardAssets::get(path) {
+        Some(f) => ([(header::CONTENT_TYPE, asset_mime(path))], f.data.into_owned()).into_response(),
+        // Fehlende Datei mit Endung -> 404; seitenartiger Pfad -> Index (Single-Page).
+        None if path.contains('.') => StatusCode::NOT_FOUND.into_response(),
+        None => dashboard_index(),
+    }
 }
 
 /// Query-Parameter für `/api/stats/requests`.
@@ -1336,6 +1397,45 @@ projects:
             store: Store::open(":memory:").unwrap(),
             sessions: SessionStore::default(),
         }
+    }
+
+    // #20: Das eingebettete Dashboard wird als Fallback ausgeliefert, ohne die API-/
+    // Proxy-Routen zu verdrängen (/healthz, /api/* behalten Vorrang).
+    #[tokio::test]
+    async fn embedded_dashboard_serves_without_shadowing_api_routes() {
+        let app = build_router(Arc::new(force_state()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // Routen-Vorrang: /healthz und die offene Stats-API bleiben erreichbar.
+        let health = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(health.status(), 200);
+        assert_eq!(health.text().await.unwrap(), "ok");
+        assert_eq!(
+            client.get(format!("{base}/api/stats/overview")).send().await.unwrap().status(),
+            200
+        );
+
+        // Fallback: `/` liefert HTML (echtes Dashboard oder "not built"-Platzhalter).
+        let root = client.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(root.status(), 200);
+        assert!(root
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+
+        // Fehlende Asset-Datei -> 404 (kein Index-Fallback für Dateien mit Endung).
+        assert_eq!(
+            client.get(format!("{base}/_astro/does-not-exist.js")).send().await.unwrap().status(),
+            404
+        );
     }
 
     // #15: Die Pipeline ist eine geordnete Plugin-Liste — ein zusätzliches Plugin wird

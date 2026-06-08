@@ -10,4 +10,6 @@ node_modules
 *.sqlite
 *.sqlite-*
 .claude
-dashboard
+test-results
+playwright-report
+e2e

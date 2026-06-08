@@ -44,7 +44,7 @@ Intent-based local LLM router. llmux sits as an OpenAI-compatible proxy between 
 - **Streaming passthrough** (`stream: true`)
 - **SQLite logging** of every request (model, tier, tokens, cost, budget pressure, `degraded`, fallback, `attempts`, `attempt_trail`, `cache_hit`, `stop_reason`, session, errors)
 
-Not yet included (by design): dashboard embedded into the binary (served standalone for now), multi-user.
+Not yet included (by design): multi-user.
 
 > **Note:** Verified against mock providers only so far. Real end-to-end tests are on the roadmap.
 
@@ -74,7 +74,7 @@ Single binary with modules (matching planned crates, separable later):
 
 | Module         | Responsibility                                          |
 |----------------|---------------------------------------------------------|
-| `api`          | HTTP layer, request pipeline (ordered budget/cache/logging plugins with pre/post hooks) |
+| `api`          | HTTP layer, request pipeline (ordered budget/cache/logging plugins with pre/post hooks), embedded dashboard |
 | `classifier`   | Prompt → `task_type` + tool-use detection               |
 | `privacy`      | Sensitive content detection                             |
 | `router`       | Dynamic selector (tier/tools/budget) + sessions         |
@@ -227,6 +227,26 @@ npm run dev            # local dev server
 npm run check          # astro type-check
 npm run test:e2e       # Playwright smoke + a11y (axe) tests
 ```
+
+### Embedded UI (single binary)
+
+The static build is embedded into the Rust binary at compile time (`rust-embed`) and
+served by axum at `/` — no Node.js process at runtime. The proxy and Stats API keep
+route precedence: `/v1/...`, `/healthz` and `/api/...` are matched first; everything else
+falls back to the dashboard (its `/_astro/*` assets included).
+
+**Build order** — build the dashboard first, then the binary:
+
+```bash
+npm install && npm run build      # produces dist/dashboard/ (embedded source)
+cargo build --release             # embeds dist/dashboard/ into the binary
+./target/release/llmux            # dashboard at http://<host>:<port>/
+```
+
+`cargo build` works even without a dashboard build (a `build.rs` ensures the embed
+folder exists); the binary then serves a "dashboard not built" placeholder while the
+proxy and Stats API are unaffected. The Dockerfile runs the dashboard build stage
+automatically.
 
 The dashboard fetches the Stats API **same-origin** by default (this is how the embedded
 build, #20, serves it). For local dev against a separately running llmux, point it at the
