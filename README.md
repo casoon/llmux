@@ -40,13 +40,17 @@ Intent-based local LLM router. llmux sits as an OpenAI-compatible proxy between 
 - **Exact-match cache** (SQLite, no embeddings): identical requests to the same model cost $0
 - **Optional semantic cache** (second stage): after an exact miss, an embedding comparison against prior requests to the same model returns a hit above a configurable similarity threshold (off by default)
 - **Optional LLM classification**: a small local model can determine `task_type`, falling back to the rule-based path on error or timeout (off by default)
+- **Providers**: OpenAI-compatible backends (OpenRouter, OpenAI, Ollama) **and a native Anthropic adapter** (`/v1/messages` translation); **multiple weighted API keys** per provider with rotation, **model aliases**, and per-provider **parameter sanitization**
+- **Routing governance**: budget-pressure tier downgrade, project-scoped policies, routing profiles, latency as a routing/reporting dimension, and a model **capability catalog** (tools/json/vision)
+- **Plugin pipeline**: budget, cache and logging expressed as ordered pre/post hooks — new cross-cutting concerns insert without touching the core request path
 - **Per-request overrides** via `x-llmux-*` headers (force model, disable cache/fallback, cost cap)
 - **Streaming passthrough** (`stream: true`)
 - **SQLite logging** of every request (model, tier, tokens, cost, budget pressure, `degraded`, fallback, `attempts`, `attempt_trail`, `cache_hit`, `stop_reason`, session, errors)
+- **Read-only Stats API** (`/api/stats/*`) and an **embedded web dashboard** served from the binary at `/`
 
 Not yet included (by design): multi-user.
 
-> **Note:** Verified against mock providers only so far. Real end-to-end tests are on the roadmap.
+> **Note:** The automated suite (99 Rust tests + Playwright dashboard e2e) runs against mock providers; point llmux at a real provider for live end-to-end checks.
 
 ## Agentic Workflows
 
