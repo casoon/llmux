@@ -99,13 +99,27 @@ export OPENROUTER_API_KEY=sk-or-...
 export OPENAI_API_KEY=sk-...
 
 cargo run
-# -> llmux running on http://0.0.0.0:3456
+# -> llmux running on http://localhost:3456  (dashboard at /)
 ```
 
-Environment variables:
+### Standalone (run from anywhere)
 
-- `LLMUX_CONFIG` – path to config (default: `config/llmux.yaml`)
-- `LLMUX_DB` – path to SQLite DB (default: `data/llmux.sqlite`)
+The release binary is self-contained — the dashboard is embedded, so no Node and no
+repo checkout are needed at runtime. It finds its config in your user directory:
+
+```bash
+cargo install --path .                         # or: cargo build --release
+mkdir -p ~/.config/llmux
+cp config/llmux.example.yaml ~/.config/llmux/llmux.yaml   # then edit providers/keys
+llmux                                          # run from any directory
+# -> config from ~/.config/llmux/llmux.yaml, DB at ~/.local/share/llmux/llmux.sqlite
+#    dashboard at http://localhost:3456/
+```
+
+### Config & data resolution
+
+- **Config** (first match wins): `LLMUX_CONFIG` → `./config/llmux.yaml` (repo/local) → `~/.config/llmux/llmux.yaml` (`$XDG_CONFIG_HOME` honored). If none exist, startup fails with instructions.
+- **SQLite DB**: `LLMUX_DB` → `~/.local/share/llmux/llmux.sqlite` when the config came from the user directory (`$XDG_DATA_HOME` honored), otherwise `./data/llmux.sqlite`. The parent directory is created automatically.
 - `RUST_LOG` – e.g. `llmux=debug`
 
 ### Docker
