@@ -45,6 +45,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(path = %db_path, "SQLite-Log geöffnet");
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
+    // Browserfähige Anzeige-URL: 0.0.0.0/:: ist eine Bind-Adresse, kein Ziel zum Öffnen.
+    let display_host = match cfg.server.host.as_str() {
+        "0.0.0.0" | "::" | "[::]" => "localhost",
+        h => h,
+    };
+    let display_addr = format!("{display_host}:{}", cfg.server.port);
     let state = Arc::new(AppState {
         cfg,
         http: reqwest::Client::new(),
@@ -76,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = api::build_router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("llmux läuft auf http://{addr}");
+    tracing::info!("llmux läuft auf http://{display_addr}  (Dashboard unter /)");
     axum::serve(listener, app).await?;
     Ok(())
 }
