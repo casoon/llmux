@@ -46,6 +46,17 @@ cache:
   eviction_interval_seconds: 300
   # Optionales Zeilenlimit; älteste Einträge fallen zuerst raus. Weglassen = unbegrenzt.
   max_entries: 10000
+  # Optionaler Semantic-Cache als zweite Stufe (#14): nach einem Exact-Miss wird das
+  # Embedding des User-Texts gegen frühere Antworten desselben Modells verglichen
+  # (Cosine >= threshold). Vektor-Store in SQLite; nur für non-streaming Requests.
+  # Fehlt der Block oder ist enabled: false, bleibt es beim Exact-Match-Cache.
+  # semantic:
+  #   enabled: true
+  #   base_url: "http://localhost:11434/v1"   # OpenAI-kompatibler /embeddings-Endpoint
+  #   model: "nomic-embed-text"
+  #   api_key_env: null                        # nur falls der Endpoint Auth verlangt
+  #   timeout_ms: 1500
+  #   threshold: 0.85                          # Cosine-Schwelle; höher = strenger
 
 privacy:
   local_first: true
@@ -67,6 +78,15 @@ privacy:
 # bestimmt, nicht aus dem großen statischen Prefix der Agent-Clients (#22).
 classifier:
   user_messages: 1
+  # Optionaler LLM-Klassifikator (#13): ein kleines lokales Modell bestimmt den
+  # task_type. Bei Fehler/Timeout greift nahtlos die Regelklassifikation. Fehlt der
+  # Block oder ist enabled: false, bleibt alles regelbasiert.
+  # llm:
+  #   enabled: true
+  #   base_url: "http://localhost:11434/v1"   # OpenAI-kompatibel (z. B. Ollama)
+  #   model: "qwen2.5:0.5b"
+  #   api_key_env: null                        # nur falls der Endpoint Auth verlangt
+  #   timeout_ms: 1500
 
 providers:
   openrouter:

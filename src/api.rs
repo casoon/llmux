@@ -44,6 +44,13 @@ struct Plan {
     tools_expected: bool,
 }
 
+/// Daten für den Semantic-Cache-Store (#14): unter welchem Modell-Scope und mit welchem
+/// Query-Embedding eine erfolgreiche Antwort abgelegt wird. `None` = Semantic-Cache aus.
+struct SemanticCache {
+    scope: String,
+    embedding: Vec<f32>,
+}
+
 /// Klassifikation eines Provider-Fehlers für die Retry-/Fallback-Strategie.
 enum Outcome {
     Transient,    // 5xx/408 -> gleicher Key erneut (mit Backoff), dann nächstes Modell
@@ -195,7 +202,9 @@ async fn chat_completions(
         classifier::TaskType::PrivateSensitive
     } else {
         let user_text = extract_user_text(&body, state.cfg.classifier.user_messages);
-        classifier::classify(&user_text)
+        // Optionaler LLM-Klassifikator (#13); fällt bei Fehler/Timeout auf die Regeln zurück.
+        classifier::classify_with_llm(&state.http, state.cfg.classifier.llm.as_ref(), &user_text)
+            .await
     };
     let task_key = task.as_key();
 
@@ -257,6 +266,32 @@ async fn chat_completions(
         }
     }
 
+    // Semantic-Cache (zweite Stufe, #14): nur non-stream, nach Exact-Miss. Embedding des
+    // User-Texts holen, ähnliche frühere Antwort desselben Modells suchen; sonst das
+    // Embedding für den späteren Store merken.
+    let semantic = if cacheable && !is_stream {
+        match state.cfg.cache.semantic.as_ref().filter(|s| s.enabled) {
+            Some(scfg) => {
+                let text = extract_user_text(&body, usize::MAX);
+                match cache::fetch_embedding(&state.http, scfg, &text).await {
+                    Some(emb) => {
+                        let scope = cache::semantic_scope(&primary);
+                        if let Some(cached) =
+                            state.store.semantic_cache_lookup(&scope, &emb, scfg.threshold)
+                        {
+                            return cache_hit_response(&state, &primary, &plan, task_key, &tool, &session, cached, started);
+                        }
+                        Some(SemanticCache { scope, embedding: emb })
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     tracing::info!(
         task = task_key, tier = plan.tier, degraded = plan.degraded,
         tools = requires_tools, input_tokens,
@@ -266,7 +301,7 @@ async fn chat_completions(
         "routing"
     );
 
-    forward_with_retries(&state, body, plan, task_key, &tool, &session, is_stream, input_tokens, cache_key, started).await
+    forward_with_retries(&state, body, plan, task_key, &tool, &session, is_stream, input_tokens, cache_key, semantic, started).await
 }
 
 /// Baut den Plan: entweder erzwungenes Modell (Header) oder dynamische Auswahl.
@@ -431,6 +466,7 @@ async fn forward_with_retries(
     is_stream: bool,
     input_tokens: u64,
     cache_key: Option<String>,
+    semantic: Option<SemanticCache>,
     started: Instant,
 ) -> Response {
     let mut trail: Vec<Value> = Vec::new();
@@ -463,7 +499,7 @@ async fn forward_with_retries(
                         return handle_success(
                             state, resp, entry, &plan, task_key, tool, session,
                             entry.provider != plan.chain[0].provider || entry.model != plan.chain[0].model,
-                            is_stream, input_tokens, attempts, trail, cache_key, started,
+                            is_stream, input_tokens, attempts, trail, cache_key, semantic, started,
                         )
                         .await;
                     }
@@ -569,6 +605,7 @@ async fn handle_success(
     attempts: u32,
     trail: Vec<Value>,
     cache_key: Option<String>,
+    semantic: Option<SemanticCache>,
     started: Instant,
 ) -> Response {
     let status = resp.status();
@@ -639,12 +676,20 @@ async fn handle_success(
     let tool_call_present = response_has_tool_call(&payload);
     let real_cost = entry.est_cost(prompt_tokens, completion_tokens);
 
-    // Erfolgreiche, nicht-streamende Antwort cachen.
+    // Erfolgreiche, nicht-streamende Antwort cachen (Exact + optional Semantic, #14).
     if let Some(key) = &cache_key {
         if let Ok(s) = serde_json::to_string(&payload) {
             state
                 .store
                 .cache_store(key, &entry.model, &s, state.cfg.cache.ttl_seconds);
+            if let Some(sem) = &semantic {
+                state.store.semantic_cache_store(
+                    &sem.scope,
+                    &sem.embedding,
+                    &s,
+                    state.cfg.cache.ttl_seconds,
+                );
+            }
         }
     }
 
