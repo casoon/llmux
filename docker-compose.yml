@@ -1,0 +1,25 @@
+services:
+  llmux:
+    build: .
+    image: llmux:latest
+    ports:
+      - "3456:3456"
+    # Provider-Keys (OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
+    # aus .env; siehe .env.example.
+    env_file:
+      - .env
+    volumes:
+      # Eigene Konfiguration (read-only) — aus config/llmux.example.yaml ableiten.
+      - ./config/llmux.yaml:/app/config/llmux.yaml:ro
+      # Persistente SQLite-Logs/Cache.
+      - llmux-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3456/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  llmux-data:

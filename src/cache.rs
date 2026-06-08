@@ -63,6 +63,7 @@ mod tests {
             tier: 1,
             context: 8000,
             supports_tools: false,
+            capabilities: Vec::new(),
             input_per_mtok: 0.0,
             output_per_mtok: 0.0,
             strip_params: Vec::new(),

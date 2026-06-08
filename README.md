@@ -102,6 +102,19 @@ Environment variables:
 - `LLMUX_DB` – path to SQLite DB (default: `data/llmux.sqlite`)
 - `RUST_LOG` – e.g. `llmux=debug`
 
+### Docker
+
+```bash
+cp config/llmux.example.yaml config/llmux.yaml   # edit providers/catalog
+cp .env.example .env                             # add provider keys
+docker compose up -d
+curl -fsS http://localhost:3456/healthz          # -> ok
+```
+
+The SQLite DB persists in the `llmux-data` volume; the config is mounted read-only
+and keys come from `.env`. For TLS (reverse proxy), key management, volume backup,
+and pointing your tools at the gateway, see **[docs/deployment.md](docs/deployment.md)**.
+
 ## Connecting Tools
 
 ```
@@ -113,6 +126,8 @@ Model:    anything — llmux overrides the model based on classification
 Optional headers:
 
 - `x-llmux-tool: aider` — identifies the tool in logs
+- `x-llmux-project: <name>` — applies that project's routing scope (see Configuration) and tags it in logs
+- `x-llmux-profile: interactive|balanced|batch` — routing profile; `interactive` prefers lowest expected latency over cost (see Routing Policy)
 - `x-llmux-session: <id>` — keeps an agent loop on the same model (stickiness)
 - `x-llmux-model: <model|provider/model>` — forces a catalog model (bypasses selection)
 - `x-llmux-no-cache: true` — skip cache for this request
@@ -125,15 +140,48 @@ Response header `x-llmux-cache: hit` marks a cached response.
 
 See `config/llmux.example.yaml`. Key sections:
 
-- `models` — catalog with `tier`, `context`, `supports_tools`, prices (USD/1M tokens)
-- `classification` — per `task_type`: `min_tier`, optional `require_tools` / `local_only` / `expected_output_ratio`
+- `models` — catalog with `tier`, `context`, prices (USD/1M tokens), and `capabilities` (e.g. `tools`, `json_schema`, `vision`, …); `supports_tools: true` is sugar for the `tools` capability. Unknown capability names are rejected at startup
+- `classification` — per `task_type`: `min_tier`, optional `require_tools` / `require_capabilities` / `local_only` / `expected_output_ratio`
 - `aliases` — logical names (`fast`/`best`/`cheap`) → catalog model; resolved from `x-llmux-model` or the request `model` field before selection
+- `projects` — per-project routing scopes (`projects.<name>`), resolved from `x-llmux-project`: `local_only`, `min_tier` (raises the quality floor), `require_providers` / `forbid_providers`. Merged into the policy before selection; forced overrides are validated against them too. No project header → unchanged default behavior
 - `budgets` — `daily_max_usd`, `monthly_max_usd` and `pressure_downgrade` (tier throttling)
+- `routing.default_profile` — `balanced` (default, cheapest-viable), `interactive` (prefer lowest expected latency), or `batch`; overridden per request by `x-llmux-profile`
 - `retry` — `max_retries`, `backoff_initial_ms`, `backoff_max_ms`
 - `cache` — `enabled`, `ttl_seconds`, `max_conversation_messages` (history guard), `eviction_interval_seconds`, optional `max_entries` (row cap)
 - `classifier.user_messages` — number of latest `user` messages the rule-based classifier derives `task_type` from (default `1`); the large static agent-client prefix (system prompt, tool schemas, history) is excluded so it doesn't skew the quality floor
 - `privacy.block_cloud_patterns` — triggers for local-only routing. Scan surface: user/tool message content **and** tool/function schemas. `privacy.scan_system` (default `false`) additionally scans injected `system`/`assistant` content — off by default so client boilerplate doesn't spuriously force `local_only`
 - `providers` — backends including `local: true` for local providers (Ollama), `kind: anthropic` for the native Anthropic adapter (translates to `/v1/messages`; non-streaming), `strip_params` to drop request fields the backend doesn't support (also per-model on `models[]`), `keys` for multiple weighted API keys (weighted-random selection; rotate on `401/402/403/429` before model fallback), and `prompt_caching` + `cache_billed_fraction` (default `0.1`) to discount the repeated prompt prefix in the **routing** cost estimate (real billing is unchanged)
+
+## Routing Policy
+
+llmux is a local **governance layer**, not just a cheapest-model router. Every
+request is decided along explicit policy dimensions, and the decision is recorded
+so it can be explained and reported:
+
+| Dimension    | Enforced by                                              | Logged as                          |
+|--------------|----------------------------------------------------------|------------------------------------|
+| `privacy`    | secret patterns → `local_only` (cloud excluded)          | `task_type=private_sensitive`      |
+| `capability` | required capabilities (`tools`/`json_schema`/`vision`) + context fit | `tier`, `model`, `provider`        |
+| `quality`    | task `min_tier` floor → selected tier                    | `tier`                             |
+| `cost`       | budget-pressure tier downgrade, remaining-budget gate    | `budget_pressure`, `degraded`      |
+| `override`   | `x-llmux-model` / alias forces a model                   | `forced`                           |
+
+Each request stores a single **policy result** label — one of `allowed`, `forced`,
+`cached`, `fallback`, `degraded`, `rejected` — alongside a `forced` flag and, for
+rejections, the reason (`error`). These are surfaced via `GET /api/stats/policy`
+(see [docs/stats-api.md](docs/stats-api.md)).
+
+**Forced overrides do not bypass safety/capability constraints.** A forced model is
+still validated against provider/key readiness, required tool support, context fit,
+privacy `local_only`, and remaining budget — it only bypasses cheapest-viable
+selection. An override that violates a hard constraint is rejected (`forced: true`,
+`result: rejected`).
+
+**Latency** is both reported and (optionally) used for routing. It is always
+aggregated for reporting (`GET /api/stats/latency`, p50/p95 by provider/task). It
+affects *selection* only under the `interactive` profile, which orders viable
+candidates by lowest expected p50 latency (from logs) before cost — all hard filters
+and the budget gate still apply. The default `balanced` profile is cheapest-viable.
 
 ## Querying Logs
 
@@ -143,6 +191,21 @@ sqlite3 data/llmux.sqlite \
           ROUND(SUM(real_cost_usd),4) AS cost, SUM(degraded) AS downgrades
    FROM requests GROUP BY task_type, model, tier;"
 ```
+
+## Stats API
+
+Read-only JSON endpoints over the request log, authenticated with the same
+`auth.llmux_key` as the proxy:
+
+- `GET /api/stats/overview` — requests/min, cost today/month, budget pressure, cache hit rate, p95 latency
+- `GET /api/stats/requests?limit=50` — recent route decisions (live feed / inspector)
+- `GET /api/stats/models` — per-model cost, latency p50/p95, success/error/fallback/cache rates
+- `GET /api/stats/policy` — allowed/rejected/degraded/fallback/cached/forced/local-only counts + top rejection reasons
+- `GET /api/stats/projects` — per-project requests, cost, rejects, forced, local-only
+- `GET /api/stats/quality` — per-model/task reliability proxies: success/error/fallback rates, stop-reason distribution, "tools expected but no tool call", error clusters (operational signals, not semantic evaluation)
+- `GET /api/stats/latency` — p50/p95 latency by provider and task type, plus cache-hit vs provider latency
+
+Response shapes are documented in **[docs/stats-api.md](docs/stats-api.md)**.
 
 ## License
 

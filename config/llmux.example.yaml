@@ -1,4 +1,11 @@
 # llmux Beispiel-Konfiguration (dynamischer, tier-basierter Router)
+#
+# llmux ist eine lokale Governance-/Policy-Schicht: jeder Request wird entlang
+# expliziter Dimensionen entschieden — privacy (block_cloud_patterns -> local_only),
+# capability (Tools/Kontext), quality (min_tier), cost (budgets/pressure_downgrade)
+# und override (x-llmux-model). Das Ergebnis wird je Request als Policy-Label
+# geloggt und über GET /api/stats/policy ausgewertet. Erzwungene Overrides umgehen
+# die harten Sicherheits-/Fähigkeitsbedingungen nicht (siehe README "Routing Policy").
 server:
   host: "0.0.0.0"
   port: 3456
@@ -15,6 +22,12 @@ budgets:
     - { at: 0.50, max_tier: 4 }   # ab 50 % Auslastung kein Top-Tier mehr
     - { at: 0.80, max_tier: 2 }   # ab 80 % nur noch günstige Modelle
     - { at: 0.95, max_tier: 1 }   # ab 95 % nur noch lokal/free
+
+# Routing-Profil (#30): balanced (Default, günstigstes gültiges Modell), interactive
+# (niedrigste erwartete p50-Latenz aus den Logs zuerst) oder batch. Pro Request via
+# Header x-llmux-profile überschreibbar. Harte Filter/Budget gewinnen immer.
+routing:
+  default_profile: balanced
 
 # Smart Retry: transiente Fehler (5xx/429/Netzwerk) -> gleiches Modell mit Backoff;
 # 401/402/403 -> nächstes Modell; sonstige 4xx -> Abbruch ohne Fallback.
@@ -91,15 +104,20 @@ providers:
 # Modell-Katalog: der Selektor wählt daraus dynamisch das günstigste Modell,
 # das Tier-Floor, Tool-Bedarf, Kontextgröße, Privacy und Budget erfüllt.
 # tier: 1 = billig/lokal … 5 = Top-Reasoning. Preise in USD pro 1 Mio Tokens.
+# capabilities (#31): bekannte Namen sind tools, json_schema, vision, streaming,
+# streaming_usage, large_context, reasoning, strict_tool_schema. supports_tools: true
+# ist Sugar für die tools-Capability. tools/json_schema/vision werden aus dem Request
+# automatisch als Pflicht-Anforderung erkannt; Task-Regeln können weitere via
+# require_capabilities verlangen. Unbekannte Namen werden beim Start abgewiesen.
 models:
   - { provider: ollama, model: "qwen2.5", tier: 1, context: 32000, supports_tools: false, input_per_mtok: 0.0, output_per_mtok: 0.0 }
   - { provider: ollama, model: "deepseek-coder", tier: 2, context: 16000, supports_tools: false, input_per_mtok: 0.0, output_per_mtok: 0.0 }
   - { provider: openrouter, model: "meta-llama/llama-3.1-8b-instruct:free", tier: 1, context: 128000, supports_tools: true, input_per_mtok: 0.0, output_per_mtok: 0.0 }
-  - { provider: openrouter, model: "google/gemini-flash-1.5", tier: 2, context: 1000000, supports_tools: true, input_per_mtok: 0.075, output_per_mtok: 0.30 }
-  - { provider: openai, model: "gpt-4.1-mini", tier: 3, context: 128000, supports_tools: true, input_per_mtok: 0.40, output_per_mtok: 1.60 }
-  - { provider: openrouter, model: "anthropic/claude-3.5-sonnet", tier: 4, context: 200000, supports_tools: true, input_per_mtok: 3.00, output_per_mtok: 15.00 }
-  - { provider: openrouter, model: "google/gemini-pro-1.5", tier: 4, context: 2000000, supports_tools: true, input_per_mtok: 1.25, output_per_mtok: 5.00 }
-  - { provider: openrouter, model: "anthropic/claude-3-opus", tier: 5, context: 200000, supports_tools: true, input_per_mtok: 15.00, output_per_mtok: 75.00 }
+  - { provider: openrouter, model: "google/gemini-flash-1.5", tier: 2, context: 1000000, supports_tools: true, capabilities: ["json_schema", "vision", "large_context"], input_per_mtok: 0.075, output_per_mtok: 0.30 }
+  - { provider: openai, model: "gpt-4.1-mini", tier: 3, context: 128000, supports_tools: true, capabilities: ["json_schema", "vision"], input_per_mtok: 0.40, output_per_mtok: 1.60 }
+  - { provider: openrouter, model: "anthropic/claude-3.5-sonnet", tier: 4, context: 200000, supports_tools: true, capabilities: ["json_schema", "vision"], input_per_mtok: 3.00, output_per_mtok: 15.00 }
+  - { provider: openrouter, model: "google/gemini-pro-1.5", tier: 4, context: 2000000, supports_tools: true, capabilities: ["json_schema", "vision", "large_context"], input_per_mtok: 1.25, output_per_mtok: 5.00 }
+  - { provider: openrouter, model: "anthropic/claude-3-opus", tier: 5, context: 200000, supports_tools: true, capabilities: ["vision"], input_per_mtok: 15.00, output_per_mtok: 75.00 }
 
 # task_type -> Anforderung. min_tier = Qualitäts-Floor; require_tools/local_only =
 # harte Bedingungen; expected_output_ratio steuert Kostenschätzung & Ranking.
@@ -109,6 +127,17 @@ aliases:
   fast: "google/gemini-flash-1.5"
   best: "anthropic/claude-3-opus"
   cheap: "meta-llama/llama-3.1-8b-instruct:free"
+
+# Projekt-Scopes (#33): pro Projekt zusätzliche Routing-Regeln, aufgelöst über den
+# x-llmux-project-Header. Werden vor der Auswahl mit der Task-Policy verschmolzen;
+# erzwungene Overrides (x-llmux-model) umgehen sie nicht. Ohne Header: Default.
+projects:
+  client-api:
+    local_only: true               # sensible Kundendaten nie in die Cloud
+  checkout:
+    min_tier: 3                     # kritisches Projekt -> mindestens Tier 3
+  docs:
+    forbid_providers: ["openai"]    # nur günstige/lokale Backends für Doku
 
 classification:
   simple_text:       { min_tier: 1, expected_output_ratio: 0.5 }
