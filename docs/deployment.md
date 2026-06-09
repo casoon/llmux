@@ -97,6 +97,11 @@ Notes:
   `Authorization: Bearer <key>`. Requests without a valid key get `401`. The
   comparison is constant-time. Keep this key out of the repo as well (e.g. set it
   from `.env` and reference it in your config, or template the config at deploy).
+- **Auth boundary**: the gateway key protects the **proxy** (`/v1/...`) only. The
+  dashboard (`/`) and the read-only Stats API (`/api/stats/*`) are **unauthenticated**
+  by design (local instance). If you expose llmux beyond localhost, restrict `/` and
+  `/api/` at the reverse proxy (e.g. basic auth / IP allowlist) — they reveal request
+  history, models, costs and projects.
 - **Local-only routing**: prompts matching `privacy.block_cloud_patterns` are
   forced to local providers and never reach the cloud — useful when sensitive
   repositories share the same gateway.
