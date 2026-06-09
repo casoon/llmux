@@ -90,6 +90,60 @@ fn resolve_db_path(config_from_user_dir: bool) -> PathBuf {
     PathBuf::from("data/llmux.sqlite")
 }
 
+/// Eingebettete Vorlagen (zur Compile-Zeit), damit `llmux init` ohne Repo funktioniert.
+const EXAMPLE_CONFIG: &str = include_str!("../config/llmux.example.yaml");
+const DEMO_CONFIG: &str = include_str!("../config/llmux.demo.yaml");
+
+fn print_help() {
+    println!(
+        "llmux — local intent-based LLM router\n\n\
+         USAGE:\n  \
+         llmux                 Run the proxy + dashboard (resolves your config)\n  \
+         llmux --demo          Run with the built-in echo provider (no key/cloud, in-memory)\n  \
+         llmux init            Write an example config to ~/.config/llmux/llmux.yaml\n  \
+         llmux init --demo     Write the echo demo config there instead\n  \
+         llmux init --force    Overwrite an existing config\n  \
+         llmux --help          Show this help\n\n\
+         Config resolution: LLMUX_CONFIG -> ./config/llmux.yaml -> ~/.config/llmux/llmux.yaml\n\
+         Dashboard + Stats API are served at /. Env: LLMUX_CONFIG, LLMUX_DB, RUST_LOG."
+    );
+}
+
+/// `llmux init [--demo] [--force]`: schreibt eine Start-Config ins User-Verzeichnis
+/// (oder nach `LLMUX_CONFIG`), ohne Bestehendes zu überschreiben (außer `--force`).
+fn cmd_init(args: &[String]) -> anyhow::Result<()> {
+    let demo = args.iter().any(|a| a == "--demo");
+    let force = args.iter().any(|a| a == "--force");
+
+    let target = match std::env::var_os("LLMUX_CONFIG") {
+        Some(p) => PathBuf::from(p),
+        None => user_config_dir()
+            .map(|d| d.join("llmux.yaml"))
+            .ok_or_else(|| anyhow::anyhow!("Kein HOME/XDG_CONFIG_HOME — setze LLMUX_CONFIG"))?,
+    };
+
+    if target.exists() && !force {
+        println!(
+            "Config existiert bereits: {}\nMit --force überschreiben.",
+            target.display()
+        );
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, if demo { DEMO_CONFIG } else { EXAMPLE_CONFIG })?;
+
+    println!("Config geschrieben: {}", target.display());
+    if demo {
+        println!("Demo-Provider (echo) aktiv — starte: llmux");
+    } else {
+        println!("Provider-Keys in der Config/.env eintragen, dann starten: llmux");
+        println!("Oder ohne Setup ausprobieren: llmux --demo");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -99,17 +153,36 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let (config_path, from_user_dir) = resolve_config_path()?;
-    let cfg = Config::load(&config_path)?;
-    cfg.validate()?;
-    tracing::info!(path = %config_path.display(), "Konfiguration geladen und validiert");
-
-    let db_path = resolve_db_path(from_user_dir);
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--help") | Some("-h") | Some("help") => {
+            print_help();
+            return Ok(());
+        }
+        Some("init") => return cmd_init(&args),
+        _ => {}
     }
-    let store = Store::open(db_path.to_str().unwrap_or("data/llmux.sqlite"))?;
-    tracing::info!(path = %db_path.display(), "SQLite-Log geöffnet");
+    let demo = args.iter().any(|a| a == "--demo");
+
+    // Config laden: Demo nutzt die eingebettete Echo-Config (keine Datei), sonst Discovery.
+    let (cfg, source, db_path) = if demo {
+        let cfg: Config = serde_yaml::from_str(DEMO_CONFIG)?;
+        let db = std::env::var("LLMUX_DB").unwrap_or_else(|_| ":memory:".into());
+        (cfg, "demo (eingebauter echo-Provider)".to_string(), db)
+    } else {
+        let (path, from_user_dir) = resolve_config_path()?;
+        let cfg = Config::load(&path)?;
+        let db = resolve_db_path(from_user_dir);
+        if let Some(parent) = db.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        (cfg, path.display().to_string(), db.to_string_lossy().into_owned())
+    };
+    cfg.validate()?;
+    tracing::info!(source = %source, "Konfiguration geladen und validiert");
+
+    let store = Store::open(&db_path)?;
+    tracing::info!(path = %db_path, "SQLite-Log geöffnet");
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     // Browserfähige Anzeige-URL: 0.0.0.0/:: ist eine Bind-Adresse, kein Ziel zum Öffnen.
@@ -152,4 +225,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("llmux läuft auf http://{display_addr}  (Dashboard unter /)");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Die eingebetteten Vorlagen (`init`, `--demo`) müssen jederzeit parsen und die
+    // Konsistenzprüfung bestehen.
+    #[test]
+    fn embedded_configs_parse_and_validate() {
+        for (name, raw) in [("example", EXAMPLE_CONFIG), ("demo", DEMO_CONFIG)] {
+            let cfg: Config =
+                serde_yaml::from_str(raw).unwrap_or_else(|e| panic!("{name} parst nicht: {e}"));
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{name} ist inkonsistent: {e}"));
+        }
+    }
 }

@@ -1,0 +1,45 @@
+# llmux Demo-Konfiguration — nur der eingebaute Echo-Provider (keine Cloud, kein Key).
+# Jeder Request wird lokal mit einer synthetischen Completion beantwortet, sodass das
+# Routing und das Dashboard sofort *grüne* Routen zeigen. Gestartet via `llmux --demo`
+# (ohne Datei) oder `llmux init --demo` (schreibt diese Datei ins User-Verzeichnis).
+# NICHT für echten Traffic gedacht.
+
+server:
+  host: "0.0.0.0"
+  port: 3456
+
+auth:
+  llmux_key: ""   # offen — nur für die Demo (lokal)
+
+providers:
+  echo:
+    enabled: true
+    kind: echo
+    local: true
+    base_url: "echo://local"   # vom Echo-Provider ignoriert
+
+# Echo-Modelle über alle Tiers, damit jede task_type-Qualitätsschwelle erfüllt wird.
+# Aufsteigende (Mini-)Kosten, damit „cheapest-viable" das jeweils niedrigste zulässige
+# Tier wählt — so zeigt die Demo echtes tier-gerechtes Routing statt immer denselben.
+models:
+  - { provider: echo, model: "echo-nano",  tier: 1, context: 200000, supports_tools: true, capabilities: ["json_schema", "vision"], input_per_mtok: 0.01, output_per_mtok: 0.02 }
+  - { provider: echo, model: "echo-mini",  tier: 2, context: 200000, supports_tools: true, capabilities: ["json_schema", "vision"], input_per_mtok: 0.05, output_per_mtok: 0.10 }
+  - { provider: echo, model: "echo-base",  tier: 3, context: 200000, supports_tools: true, capabilities: ["json_schema", "vision"], input_per_mtok: 0.20, output_per_mtok: 0.40 }
+  - { provider: echo, model: "echo-pro",   tier: 4, context: 200000, supports_tools: true, capabilities: ["json_schema", "vision"], input_per_mtok: 0.80, output_per_mtok: 1.60 }
+  - { provider: echo, model: "echo-ultra", tier: 5, context: 200000, supports_tools: true, capabilities: ["json_schema", "vision"], input_per_mtok: 3.00, output_per_mtok: 6.00 }
+
+classification:
+  simple_text:       { min_tier: 1, expected_output_ratio: 1.0 }
+  summarize:         { min_tier: 1 }
+  code_review:       { min_tier: 3 }
+  architecture:      { min_tier: 4 }
+  private_sensitive: { min_tier: 1, local_only: true }
+
+cache:
+  enabled: true
+  ttl_seconds: 1800
+  max_conversation_messages: 6
+  eviction_interval_seconds: 300
+
+privacy:
+  block_cloud_patterns: ["PRIVATE_KEY", "BEGIN RSA PRIVATE KEY"]

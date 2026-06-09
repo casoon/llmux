@@ -542,6 +542,19 @@ async fn forward_with_retries(
     for entry in plan.chain.iter() {
         let target = entry.target();
 
+        // Eingebauter Echo-/Demo-Provider: keine Cloud, kein Key — synthetische 200er-
+        // Antwort, ohne HTTP. So zeigt das Dashboard sofort grüne Routen.
+        if state.cfg.provider_kind(&target.provider) == ProviderKind::Echo {
+            attempts += 1;
+            trail.push(json!({ "provider": target.provider, "model": target.model, "echo": true, "status": 200 }));
+            let used_fallback =
+                entry.provider != plan.chain[0].provider || entry.model != plan.chain[0].model;
+            return echo_respond(
+                state, entry, &plan, task_key, tool, session, used_fallback, is_stream,
+                input_tokens, attempts, trail, cache_key, semantic, started, &body,
+            );
+        }
+
         // Einsatzbereite Keys für dieses Modell auflösen und gewichtet ordnen.
         let resolved = match state.cfg.providers.get(&target.provider) {
             Some(p) => providers::resolve_keys(p, &target.model),
@@ -787,6 +800,122 @@ async fn handle_success(
     );
 
     (status, Json(payload)).into_response()
+}
+
+/// Synthetische Antwort des eingebauten Echo-/Demo-Providers (kein HTTP). Baut eine
+/// OpenAI-Completion (oder SSE bei `stream`) und läuft durch dieselben post-Hooks
+/// (Cache-Store + Logging) wie eine echte Erfolgsantwort.
+#[allow(clippy::too_many_arguments)]
+fn echo_respond(
+    state: &Arc<AppState>,
+    entry: &ModelEntry,
+    plan: &Plan,
+    task_key: &str,
+    tool: &str,
+    session: &Option<String>,
+    used_fallback: bool,
+    is_stream: bool,
+    input_tokens: u64,
+    attempts: u32,
+    trail: Vec<Value>,
+    cache_key: Option<String>,
+    semantic: Option<SemanticCache>,
+    started: Instant,
+    body: &Value,
+) -> Response {
+    let trail_json = serde_json::to_string(&trail).ok();
+    let user = extract_user_text(body, 1);
+    let snippet = truncate(user.trim(), 160);
+    let content = format!(
+        "llmux demo · echo provider.\nRouted to {}/{} (tier {}, task: {}). No external call \
+         was made — this is a synthetic response so you can see routing and the dashboard \
+         end-to-end.\n\nYour message: \"{}\"",
+        entry.provider,
+        entry.model,
+        plan.tier,
+        task_key,
+        if snippet.is_empty() { "(empty)" } else { &snippet }
+    );
+    let prompt_tokens = input_tokens.max(1);
+    let completion_tokens = (content.len() as u64).div_ceil(4);
+    let real_cost = entry.est_cost(prompt_tokens, completion_tokens);
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let (response, body_str) = if is_stream {
+        let delta = json!({
+            "id": "chatcmpl-echo", "object": "chat.completion.chunk", "created": created,
+            "model": entry.model,
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "content": content }, "finish_reason": null }]
+        });
+        let done = json!({
+            "id": "chatcmpl-echo", "object": "chat.completion.chunk", "created": created,
+            "model": entry.model,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens }
+        });
+        let sse = format!("data: {delta}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+        let resp = (
+            StatusCode::OK,
+            [("content-type", "text/event-stream"), ("x-llmux-echo", "1")],
+            sse.clone(),
+        )
+            .into_response();
+        (resp, Some(sse))
+    } else {
+        let payload = json!({
+            "id": "chatcmpl-echo", "object": "chat.completion", "created": created,
+            "model": entry.model,
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": content }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens }
+        });
+        let s = serde_json::to_string(&payload).ok();
+        let resp = (StatusCode::OK, [("x-llmux-echo", "1")], Json(payload)).into_response();
+        (resp, s)
+    };
+
+    let out = PluginOutcome {
+        status: 200,
+        used_fallback,
+        degraded: plan.degraded,
+        estimated_tokens: input_tokens,
+        prompt_tokens,
+        completion_tokens,
+        estimated_cost_usd: entry.est_cost(input_tokens, plan.expected_output),
+        real_cost_usd: real_cost,
+        attempts,
+        attempt_trail: trail_json,
+        stop_reason: Some("stop".into()),
+        error: None,
+        tool_call_present: false,
+        body: body_str,
+    };
+    let ctx = PluginCtx {
+        state,
+        entry,
+        task_key,
+        tool,
+        session,
+        project: &plan.project,
+        tier: plan.tier,
+        pressure: plan.pressure,
+        forced: plan.forced,
+        tools_expected: plan.tools_expected,
+        expected_output: plan.expected_output,
+        input_tokens,
+        cached_prefix_tokens: 0,
+        max_cost: None,
+        cache_key: cache_key.as_ref(),
+        semantic: semantic.as_ref(),
+        is_stream,
+        started,
+    };
+    PluginPipeline::default().run_post(&ctx, &out);
+
+    tracing::info!(task = task_key, model = %entry.model, "echo response");
+    response
 }
 
 /// Eigentümer-Kontext für das verzögerte Logging/Caching einer Streaming-Antwort,
@@ -1397,6 +1526,55 @@ projects:
             store: Store::open(":memory:").unwrap(),
             sessions: SessionStore::default(),
         }
+    }
+
+    // Demo: der eingebaute Echo-Provider beantwortet Requests grün (200, allowed) ohne
+    // jeden Netzwerkaufruf und wird als Erfolg geloggt.
+    #[tokio::test]
+    async fn echo_provider_answers_green_without_network() {
+        let yaml = r#"
+server: { host: "127.0.0.1", port: 0 }
+auth: { llmux_key: "" }
+providers:
+  echo: { enabled: true, kind: echo, local: true, base_url: "echo://local" }
+models:
+  - { provider: echo, model: "echo-1", tier: 1, context: 100000, supports_tools: true, input_per_mtok: 0.0, output_per_mtok: 0.0 }
+classification:
+  simple_text:       { min_tier: 1, expected_output_ratio: 1.0 }
+  summarize:         { min_tier: 1 }
+  code_review:       { min_tier: 1 }
+  architecture:      { min_tier: 1 }
+  private_sensitive: { min_tier: 1 }
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let store = Store::open(":memory:").unwrap();
+        let state = Arc::new(AppState { cfg, http: reqwest::Client::new(), store, sessions: SessionStore::default() });
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let resp = client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({ "messages": [{ "role": "user", "content": "hello demo" }] }))
+            .send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-llmux-echo").map(|v| v.to_str().unwrap()), Some("1"));
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["model"], "echo-1");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert!(v["choices"][0]["message"]["content"].as_str().unwrap().contains("echo provider"));
+        assert!(v["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+
+        // Als grüne (allowed) Route geloggt.
+        let rq: Value = client
+            .get(format!("{base}/api/stats/requests?limit=1"))
+            .send().await.unwrap().json().await.unwrap();
+        assert_eq!(rq["requests"][0]["result"], "allowed");
+        assert_eq!(rq["requests"][0]["status"], 200);
+        assert_eq!(rq["requests"][0]["model"], "echo-1");
     }
 
     // #20: Das eingebettete Dashboard wird als Fallback ausgeliefert, ohne die API-/

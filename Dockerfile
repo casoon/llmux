@@ -25,7 +25,9 @@ RUN mkdir src \
     && rm -rf src
 
 # Eigentliche Quellen + gebautes Dashboard (rust-embed bettet dist/dashboard ein).
+# config/ wird gebraucht: example-/demo-Config sind via include_str! ins Binary eingebettet.
 COPY src ./src
+COPY config ./config
 COPY --from=dashboard /app/dist/dashboard ./dist/dashboard
 RUN touch src/main.rs && cargo build --release
 
