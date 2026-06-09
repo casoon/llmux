@@ -47,6 +47,7 @@ Intent-based local LLM router. llmux sits as an OpenAI-compatible proxy between 
 - **Streaming passthrough** (`stream: true`)
 - **SQLite logging** of every request (model, tier, tokens, cost, budget pressure, `degraded`, fallback, `attempts`, `attempt_trail`, `cache_hit`, `stop_reason`, session, errors)
 - **Read-only Stats API** (`/api/stats/*`) and an **embedded web dashboard** served from the binary at `/`
+- **Zero-setup demo**: `llmux --demo` routes through a built-in echo provider (no keys/cloud, in-memory) so routing and the dashboard work out of the box; `llmux init` scaffolds a config in your user directory
 
 Not yet included (by design): multi-user.
 
@@ -90,6 +91,26 @@ Single binary with modules (matching planned crates, separable later):
 
 ## Getting Started
 
+### Try it instantly (no keys, no setup)
+
+```bash
+cargo run -- --demo        # or, once installed: llmux --demo
+# -> open http://localhost:3456/  — the dashboard fills with live routes
+```
+
+`--demo` runs with a built-in **echo provider**: no API keys, no cloud calls, in-memory DB.
+Every request gets a synthetic response, so you can see classification, tier-based routing,
+caching, logging and the dashboard end-to-end. Generate traffic with any OpenAI-compatible
+tool — or curl:
+
+```bash
+curl -s http://localhost:3456/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"explain the architecture trade-offs"}]}'
+# simple prompts route to tier 1, code tasks to tier 3, architecture to tier 4 — all green
+```
+
+### Real providers
+
 ```bash
 # Copy the example config and adjust as needed
 cp config/llmux.example.yaml config/llmux.yaml
@@ -108,13 +129,17 @@ The release binary is self-contained — the dashboard is embedded, so no Node a
 repo checkout are needed at runtime. It finds its config in your user directory:
 
 ```bash
-cargo install --path .                         # or: cargo build --release
-mkdir -p ~/.config/llmux
-cp config/llmux.example.yaml ~/.config/llmux/llmux.yaml   # then edit providers/keys
-llmux                                          # run from any directory
+cargo install --path .         # or: cargo build --release
+llmux init                     # writes an example config to ~/.config/llmux/llmux.yaml
+#   llmux init --demo          # ...or the echo demo config instead
+#   llmux init --force         # overwrite an existing config
+$EDITOR ~/.config/llmux/llmux.yaml   # set providers/keys
+llmux                          # run from any directory
 # -> config from ~/.config/llmux/llmux.yaml, DB at ~/.local/share/llmux/llmux.sqlite
 #    dashboard at http://localhost:3456/
 ```
+
+Run `llmux --help` for the full command list.
 
 ### Config & data resolution
 
@@ -171,7 +196,7 @@ See `config/llmux.example.yaml`. Key sections:
 - `classifier.user_messages` — number of latest `user` messages the rule-based classifier derives `task_type` from (default `1`); the large static agent-client prefix (system prompt, tool schemas, history) is excluded so it doesn't skew the quality floor
 - `classifier.llm` — optional LLM classifier (off unless present with `enabled: true`): a small local model (`base_url`, `model`, optional `api_key_env`, `timeout_ms` default `1500`) determines `task_type`; on any error or timeout it falls back seamlessly to the rule-based path
 - `privacy.block_cloud_patterns` — triggers for local-only routing. Scan surface: user/tool message content **and** tool/function schemas. `privacy.scan_system` (default `false`) additionally scans injected `system`/`assistant` content — off by default so client boilerplate doesn't spuriously force `local_only`
-- `providers` — backends including `local: true` for local providers (Ollama), `kind: anthropic` for the native Anthropic adapter (translates to `/v1/messages`; non-streaming), `strip_params` to drop request fields the backend doesn't support (also per-model on `models[]`), `keys` for multiple weighted API keys (weighted-random selection; rotate on `401/402/403/429` before model fallback), and `prompt_caching` + `cache_billed_fraction` (default `0.1`) to discount the repeated prompt prefix in the **routing** cost estimate (real billing is unchanged)
+- `providers` — backends including `local: true` for local providers (Ollama), `kind: anthropic` for the native Anthropic adapter (translates to `/v1/messages`; non-streaming), `kind: echo` for the built-in demo provider (synthetic responses, no key/cloud — see `config/llmux.demo.yaml` and `llmux --demo`), `strip_params` to drop request fields the backend doesn't support (also per-model on `models[]`), `keys` for multiple weighted API keys (weighted-random selection; rotate on `401/402/403/429` before model fallback), and `prompt_caching` + `cache_billed_fraction` (default `0.1`) to discount the repeated prompt prefix in the **routing** cost estimate (real billing is unchanged)
 
 ## Routing Policy
 

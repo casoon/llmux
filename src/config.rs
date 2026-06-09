@@ -314,6 +314,10 @@ pub enum ProviderKind {
     Openai,
     /// Nativ Anthropic (`POST /messages`, `x-api-key` + `anthropic-version`).
     Anthropic,
+    /// Eingebauter Demo-/Echo-Provider: keine Cloud, kein Key. Beantwortet Requests
+    /// lokal mit einer synthetischen OpenAI-Completion — fürs Ausprobieren des Routings
+    /// und des Dashboards ohne externe Provider (grüne Routen statt `rejected`).
+    Echo,
 }
 
 /// Bekannte Modell-Fähigkeiten. `tools`/`json_schema`/`vision` werden aus dem
