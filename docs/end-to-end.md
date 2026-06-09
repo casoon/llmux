@@ -28,10 +28,13 @@ cargo run --release
 Expected startup log:
 
 ```
-INFO llmux: Konfiguration geladen und validiert path=config/llmux.yaml
+INFO llmux: Konfiguration geladen und validiert source=config/llmux.yaml
 INFO llmux: SQLite-Log geöffnet path=data/llmux.sqlite
-INFO llmux: llmux läuft auf http://0.0.0.0:3456
+INFO llmux: llmux läuft auf http://localhost:3456  (Dashboard unter /)
 ```
+
+The read-only dashboard is now served at `http://localhost:3456/`; the requests
+below show up in its live feed.
 
 If the config is malformed the server exits **before** binding, e.g.:
 
