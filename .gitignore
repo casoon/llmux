@@ -9,3 +9,7 @@
 config/llmux.yaml
 /test-results
 /playwright-report
+
+# OS / editor cruft
+.DS_Store
+*.swp
