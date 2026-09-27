@@ -53,7 +53,7 @@ Intent-based local LLM router. llmux sits as an OpenAI-compatible proxy between 
 
 Not yet included (by design): multi-user.
 
-> **Note:** The automated suite (99 Rust tests + Playwright dashboard e2e) runs against mock providers; point llmux at a real provider for live end-to-end checks.
+> **Note:** The automated suite (101 Rust tests + Playwright dashboard e2e) runs against mock providers; point llmux at a real provider for live end-to-end checks.
 
 ## Agentic Workflows
 

@@ -2,7 +2,9 @@
 name = "llmux"
 version = "0.1.0"
 edition = "2021"
-description = "Lokaler intent-basierter LLM-Router: bewertet Prompts und wählt Modell, Provider und Kostenstufe."
+description = "Intent-based local LLM router: an OpenAI-compatible proxy that classifies prompts and picks the cheapest viable model, provider and cost tier."
+homepage = "https://casoon.github.io/llmux/"
+repository = "https://github.com/casoon/llmux"
 license = "Apache-2.0"
 # The project site and its sources are not part of the crate.
 exclude = ["site/", "docs/", "examples/", ".github/"]
