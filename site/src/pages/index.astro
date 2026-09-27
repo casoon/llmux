@@ -12,8 +12,7 @@ import {
   Terminal,
 } from '@casoon/pages-theme/components';
 import Base from '@casoon/pages-theme/layouts/Base.astro';
-import { Image } from 'astro:assets';
-import dashboard from '../assets/dashboard.webp';
+import dashboard from '../assets/dashboard.webp?url';
 import hero from '../../../examples/hero.out?raw';
 import policy from '../../../examples/stats-policy.out?raw';
 
@@ -86,8 +85,11 @@ curl -s localhost:3456/v1/chat/completions \\
       The binary serves a read-only dashboard at <code>/</code>, fed by the Stats API. Captured from{' '}
       <code>llmux --demo</code> after 22 requests.
     </p>
-    <Image
+    <img
       src={dashboard}
+      width="1440"
+      height="1000"
+      decoding="async"
       alt="llmux Control Room: KPI tiles for requests per minute, cost today, budget used, cache hit rate and p95 latency above a live route feed listing each request's tool, task type, selected model and tier, cost, latency and policy result."
       loading="lazy"
     />
