@@ -1,0 +1,23 @@
+HTTP/1.1 200 OK
+x-llmux-echo: 1
+
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "llmux demo · echo provider.\nRouted to echo/echo-pro (tier 4, task: architecture). No external call was made — this is a synthetic response so you can see routing and the dashboard end-to-end.\n\nYour message: \"Explain the architecture trade-offs between a monolith and microservices.\"",
+        "role": "assistant"
+      }
+    }
+  ],
+  "id": "chatcmpl-echo",
+  "model": "echo-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 72,
+    "prompt_tokens": 19,
+    "total_tokens": 91
+  }
+}

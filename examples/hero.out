@@ -1,0 +1,9 @@
+$ curl -s localhost:3456/v1/chat/completions -H 'content-type: application/json' -d @architecture.json | jq '{model, usage}'
+{
+  "model": "echo-pro",
+  "usage": {
+    "completion_tokens": 72,
+    "prompt_tokens": 19,
+    "total_tokens": 91
+  }
+}

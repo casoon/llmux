@@ -1,4 +1,8 @@
-# Deployment
+---
+title: Deployment
+description: Run llmux with Docker Compose behind a TLS reverse proxy, manage keys, back up the database and point your tools at it.
+order: 30
+---
 
 A reproducible server setup for llmux: container startup, TLS via reverse proxy,
 key management, volume backup, and pointing your tools at the gateway.
@@ -152,4 +156,4 @@ Examples:
 
 Optional per-request headers (`x-llmux-tool`, `x-llmux-session`, `x-llmux-model`,
 `x-llmux-no-cache`, `x-llmux-no-fallback`, `x-llmux-max-cost`) are documented in
-the [README](../README.md#connecting-tools).
+the [README](https://github.com/casoon/llmux#connecting-tools).

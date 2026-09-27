@@ -1,0 +1,6 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    { "role": "user", "content": "Explain the architecture trade-offs between a monolith and microservices." }
+  ]
+}

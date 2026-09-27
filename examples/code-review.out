@@ -1,0 +1,23 @@
+HTTP/1.1 200 OK
+x-llmux-echo: 1
+
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "llmux demo · echo provider.\nRouted to echo/echo-base (tier 3, task: code_review). No external call was made — this is a synthetic response so you can see routing and the dashboard end-to-end.\n\nYour message: \"Review this function for bugs: fn add(a: i32, b: i32) -> i32 { a - b }\"",
+        "role": "assistant"
+      }
+    }
+  ],
+  "id": "chatcmpl-echo",
+  "model": "echo-base",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 71,
+    "prompt_tokens": 18,
+    "total_tokens": 89
+  }
+}

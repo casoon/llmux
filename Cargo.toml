@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Lokaler intent-basierter LLM-Router: bewertet Prompts und wählt Modell, Provider und Kostenstufe."
 license = "Apache-2.0"
+# The project site and its sources are not part of the crate.
+exclude = ["site/", "docs/", "examples/", ".github/"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

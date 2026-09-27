@@ -1,0 +1,23 @@
+HTTP/1.1 200 OK
+x-llmux-cache: hit
+
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "llmux demo · echo provider.\nRouted to echo/echo-nano (tier 1, task: simple_text). No external call was made — this is a synthetic response so you can see routing and the dashboard end-to-end.\n\nYour message: \"What is the capital of France?\"",
+        "role": "assistant"
+      }
+    }
+  ],
+  "id": "chatcmpl-echo",
+  "model": "echo-nano",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 61,
+    "prompt_tokens": 8,
+    "total_tokens": 69
+  }
+}

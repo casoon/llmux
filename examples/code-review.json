@@ -1,0 +1,6 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    { "role": "user", "content": "Review this function for bugs: fn add(a: i32, b: i32) -> i32 { a - b }" }
+  ]
+}

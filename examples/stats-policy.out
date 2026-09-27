@@ -1,0 +1,11 @@
+{
+  "allowed": 4,
+  "cached": 1,
+  "degraded": 0,
+  "fallback": 0,
+  "forced": 1,
+  "forced_rejected": 0,
+  "local_only": 1,
+  "rejected": 0,
+  "top_rejection_reasons": []
+}

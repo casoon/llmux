@@ -1,4 +1,9 @@
-# End-to-End Test Against a Live Provider (T1.1)
+---
+title: End-to-end test against a live provider
+description: Verify the full pipeline, from token estimate to logged real cost, against a real cloud provider.
+order: 40
+sidebarLabel: End-to-end test
+---
 
 This proves the full pipeline — token estimation, classification, routing,
 forwarding, real token/cost accounting, and SQLite logging — works against a
@@ -113,4 +118,4 @@ Pass criteria:
 
 > Note: this run requires a live provider key and therefore must be executed
 > manually. Everything else in the pipeline is covered by `cargo test`
-> (31 unit tests, no network).
+> (101 tests, no network, as of 2026-09-27).

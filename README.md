@@ -1,5 +1,7 @@
 # llmux
 
+**Website and documentation:** [casoon.github.io/llmux](https://casoon.github.io/llmux/)
+
 Intent-based local LLM router. llmux sits as an OpenAI-compatible proxy between your tools (Aider, Continue, Claude Code, custom agents) and AI providers. It evaluates every prompt **before** sending and decides which model, provider, and cost tier makes sense.
 
 ```

@@ -1,0 +1,133 @@
+---
+import {
+  Badge,
+  Badges,
+  BuildOutput,
+  CodeBlock,
+  Facts,
+  Features,
+  Hero,
+  Install,
+  Quickstart,
+  Terminal,
+} from '@casoon/pages-theme/components';
+import Base from '@casoon/pages-theme/layouts/Base.astro';
+import { Image } from 'astro:assets';
+import dashboard from '../assets/dashboard.webp';
+import hero from '../../../examples/hero.out?raw';
+import policy from '../../../examples/stats-policy.out?raw';
+
+const demo = `llmux --demo            # built-in echo provider: no keys, no network
+# dashboard: http://localhost:3456/
+
+curl -s localhost:3456/v1/chat/completions \\
+  -H 'content-type: application/json' \\
+  -d '{"messages":[{"role":"user","content":"explain the architecture trade-offs"}]}'`;
+---
+
+<Base>
+  <Hero
+    title="Route every prompt to the cheapest model that can handle it."
+    lead="llmux is a local, OpenAI-compatible proxy between your tools and your providers. It classifies each request, applies privacy, capability and budget rules, and forwards it to the cheapest viable model, provider and cost tier."
+  >
+    <Install
+      label="Install from source"
+      commands={[
+        {
+          label: 'source',
+          command:
+            'git clone https://github.com/casoon/llmux && cd llmux && npm ci && npm run build && cargo install --path .',
+        },
+        { label: 'cargo --git', command: 'cargo install --git https://github.com/casoon/llmux' },
+      ]}
+    />
+    <Badges>
+      <Badge>Apache-2.0</Badge>
+      <Badge>v0.1.0 prototype</Badge>
+      <Badge>Rust</Badge>
+      <Badge>single binary</Badge>
+    </Badges>
+    <Terminal slot="output" title="llmux --demo" dots ansi={hero} />
+  </Hero>
+
+  <Facts
+    items={[
+      { value: '5', label: 'task types, from simple_text to architecture' },
+      { value: '5', label: 'cost tiers in the model catalog' },
+      { value: '8', label: 'read-only Stats API endpoints' },
+      { value: '101', label: 'Rust tests passing (cargo test, 2026-09-27)' },
+    ]}
+  />
+
+  <Features
+    items={[
+      {
+        title: 'Intent-based, tier-aware selection',
+        body: 'Each task type sets a quality floor (min_tier). Among the models that clear it and fit the context window, llmux estimates the cost of this request and takes the cheapest.',
+      },
+      {
+        title: 'Privacy and capability filters first',
+        body: 'Secrets matching block_cloud_patterns force local-only routing. Requests with tools, JSON schema or images only reach models that declare those capabilities.',
+      },
+      {
+        title: 'Budgets that degrade instead of failing',
+        body: 'Daily and monthly spend is summed from the SQLite log. Above configurable thresholds the tier ceiling drops; a 402 comes only when even the cheapest model would exceed the remaining budget.',
+      },
+      {
+        title: 'Retry, fallback, cache and a log you can query',
+        body: 'Transient errors retry with backoff, exhausted providers fall through to the next candidate, identical requests come from the cache, and every decision lands in SQLite with its policy result.',
+      },
+    ]}
+  />
+
+  <section class="dashboard" aria-labelledby="dashboard-heading">
+    <h2 id="dashboard-heading" class="cp-label">Embedded dashboard</h2>
+    <p>
+      The binary serves a read-only dashboard at <code>/</code>, fed by the Stats API. Captured from{' '}
+      <code>llmux --demo</code> after 22 requests.
+    </p>
+    <Image
+      src={dashboard}
+      alt="llmux Control Room: KPI tiles for requests per minute, cost today, budget used, cache hit rate and p95 latency above a live route feed listing each request's tool, task type, selected model and tier, cost, latency and policy result."
+      loading="lazy"
+    />
+  </section>
+
+  <BuildOutput
+    caption="Policy counters from GET /api/stats/policy after the six showcase requests. Every example on this site was captured from llmux --demo with examples/capture.sh."
+    file="examples/stats-policy.out"
+    heading="Real output"
+  >
+    <Terminal ansi={policy} />
+  </BuildOutput>
+
+  <Quickstart
+    lead="Try the routing without any keys: demo mode answers every request with the built-in echo provider and an in-memory database."
+    steps={[
+      'Build and install the binary (see above), or run <code>cargo run -- --demo</code> in a checkout.',
+      'Start <code>llmux --demo</code> and open the dashboard at <code>http://localhost:3456/</code>.',
+      'Point any OpenAI-compatible client at <code>http://localhost:3456/v1</code>, or send a request with curl.',
+    ]}
+  >
+    <CodeBlock code={demo} lang="bash" title="demo" label="Shell" />
+  </Quickstart>
+</Base>
+
+<style>
+  .dashboard {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 48px 24px;
+  }
+  .dashboard p {
+    max-width: 62ch;
+  }
+  .dashboard :global(img) {
+    display: block;
+    width: 100%;
+    height: auto;
+    margin-top: 16px;
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+  }
+</style>

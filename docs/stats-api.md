@@ -1,7 +1,12 @@
-# Stats API
+---
+title: Stats API
+description: Read-only JSON endpoints over the SQLite request log that feed the dashboard.
+order: 50
+---
 
-Read-only JSON endpoints over the SQLite request log, for the dashboard (#19) and
-the future embedded UI (#20). All values are derived from real log data.
+The embedded dashboard reads these endpoints same-origin. All values are derived from
+the request log. The JSON bodies below document the response shapes; their numbers are
+illustrative, not measurements.
 
 ## Authentication
 
