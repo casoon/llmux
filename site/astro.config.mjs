@@ -11,6 +11,7 @@ export default defineConfig({
       name: 'llmux',
       description:
         'Intent-based local LLM router: an OpenAI-compatible proxy that classifies each prompt and picks the cheapest viable model, provider and cost tier.',
+      tagline: 'Intent-based local LLM router',
       repo: 'casoon/llmux',
       version: '0.1.0',
       license: 'Apache-2.0',
