@@ -19,7 +19,7 @@ steps:
 
         Your message: "hi, what is 2+2"
     delay: 13
-  - wait: 1500
+  - wait: 3000
   - run: |
       curl -s localhost:3456/v1/chat/completions -H 'content-type: application/json' -d '{{"messages":[{{"role":"user","content":"explain the architecture trade-offs"}]}' | jq -r '.choices[0].message.content'
     speed: 8
@@ -30,4 +30,4 @@ steps:
 
         Your message: "explain the architecture trade-offs"
     delay: 13
-  - wait: 3000
+  - wait: 9000
