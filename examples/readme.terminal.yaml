@@ -1,0 +1,35 @@
+# Rebuild the README SVG (the final hold comes from --loop-delay; a trailing wait: is dropped):
+#   castwright build examples/readme.terminal.yaml --format svg --loop-delay 8000 -o .github/readme && mv .github/readme/readme.svg .github/readme/demo.svg
+version: 1
+
+terminal:
+  title: llmux --demo
+  cols: 100
+  rows: 22
+  theme: catppuccin-mocha
+
+steps:
+  - run: nohup llmux --demo >/dev/null 2>&1 & sleep 1
+    speed: 8
+  - run: |
+      curl -s localhost:3456/v1/chat/completions -H 'content-type: application/json' -d '{{"messages":[{{"role":"user","content":"hi, what is 2+2"}]}' | jq -r '.choices[0].message.content'
+    speed: 8
+  - output:
+      raw: |
+        llmux demo · echo provider.
+        Routed to echo/echo-nano (tier 1, task: simple_text). No external call was made — this is a synthetic response so you can see routing and the dashboard end-to-end.
+
+        Your message: "hi, what is 2+2"
+    delay: 13
+  - wait: 3000
+  - run: |
+      curl -s localhost:3456/v1/chat/completions -H 'content-type: application/json' -d '{{"messages":[{{"role":"user","content":"explain the architecture trade-offs"}]}' | jq -r '.choices[0].message.content'
+    speed: 8
+  - output:
+      raw: |
+        llmux demo · echo provider.
+        Routed to echo/echo-pro (tier 4, task: architecture). No external call was made — this is a synthetic response so you can see routing and the dashboard end-to-end.
+
+        Your message: "explain the architecture trade-offs"
+    delay: 13
+  - wait: 9000
