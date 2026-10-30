@@ -1,3 +1,5 @@
+# Rebuild the README SVG (the final hold comes from --loop-delay; a trailing wait: is dropped):
+#   castwright build examples/readme.terminal.yaml --format svg --loop-delay 8000 -o .github/readme && mv .github/readme/readme.svg .github/readme/demo.svg
 version: 1
 
 terminal:
