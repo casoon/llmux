@@ -29,6 +29,10 @@ Intent-based local LLM router. llmux sits as an OpenAI-compatible proxy between 
                cheapest viable model for the task
 ```
 
+<p align="center">
+  <img src=".github/readme/demo.svg" alt="llmux --demo runs with the built-in echo provider; a short prompt is routed to echo-nano (tier 1, simple_text), a prompt about architecture trade-offs to echo-pro (tier 4, architecture)." width="864">
+</p>
+
 ## Status: Prototype (v0.1)
 
 - **OpenAI-compatible endpoint** `POST /v1/chat/completions` (+ `GET /healthz`)
