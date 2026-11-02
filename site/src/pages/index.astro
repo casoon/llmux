@@ -3,6 +3,7 @@ import {
   Badge,
   Badges,
   BuildOutput,
+  CallToAction,
   CodeBlock,
   Facts,
   Features,
@@ -12,6 +13,7 @@ import {
   Terminal,
 } from '@casoon/pages-theme/components';
 import Base from '@casoon/pages-theme/layouts/Base.astro';
+import { url } from '@casoon/pages-theme/url';
 import dashboard from '../assets/dashboard.webp?url';
 import hero from '../../../examples/hero.out?raw';
 import policy from '../../../examples/stats-policy.out?raw';
@@ -113,6 +115,12 @@ curl -s localhost:3456/v1/chat/completions \\
   >
     <CodeBlock code={demo} lang="bash" title="demo" label="Shell" />
   </Quickstart>
+
+  <CallToAction
+    title="Route your first request in demo mode."
+    href={url('docs/quickstart/')}
+    label="Read the quickstart"
+  />
 </Base>
 
 <style>
