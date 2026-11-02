@@ -31,6 +31,10 @@ No version has been tagged yet; `Cargo.toml` is at 0.1.0.
   provider.
 - Per-request override headers `x-llmux-*`.
 
+### Changed
+
+- **Pages:** the project site uses the current shared theme (0.12.5).
+
 ### Security
 
 - Constant-time comparison of the gateway key.
