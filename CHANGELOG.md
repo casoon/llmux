@@ -33,7 +33,7 @@ No version has been tagged yet; `Cargo.toml` is at 0.1.0.
 
 ### Changed
 
-- **Pages:** the project site uses the current shared theme (0.12.6).
+- **Pages:** the project site uses the current shared theme (0.12.8).
 
 ### Security
 
